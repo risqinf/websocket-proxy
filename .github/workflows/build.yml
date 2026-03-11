@@ -47,13 +47,14 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
+          cache: false
 
-      - name: Download dependencies
-        run: go mod download
-
-      - name: Verify dependencies
-        run: go mod verify
+      - name: Initialize Go module
+        run: |
+          if [ ! -f go.mod ]; then
+            go mod init ssh-ws
+          fi
+          go mod tidy
 
       - name: Go Vet
         run: go vet ./...
@@ -201,7 +202,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
+          cache: false
 
       - name: Get version info
         id: version
@@ -214,8 +215,12 @@ jobs:
           echo "commit=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
 
-      - name: Download dependencies
-        run: go mod download
+      - name: Initialize Go module
+        run: |
+          if [ ! -f go.mod ]; then
+            go mod init ssh-ws
+          fi
+          go mod tidy
 
       - name: Build binary
         id: build
