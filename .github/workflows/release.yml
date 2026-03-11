@@ -179,10 +179,14 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
+          cache: false
 
-      - name: Download dependencies
-        run: go mod download
+      - name: Initialize Go module
+        run: |
+          if [ ! -f go.mod ]; then
+            go mod init ssh-ws
+          fi
+          go mod tidy
 
       - name: Build binary
         id: build
