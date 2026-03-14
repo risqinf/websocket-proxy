@@ -30,7 +30,7 @@
  * CMD Compile:
  * CGO_ENABLED=0 go build -ldflags "-s -w \
  *   -X 'main.Credits=Risqi Nur Fadhilah' \
- *   -X 'main.Version=v1.3-Stable'" -o ssh-ws
+ *   -X 'main.Version=v1.3.0'" -o ssh-ws
  *
  * Requirements:
  * - Debian 11 / Ubuntu 22.04+
@@ -329,13 +329,15 @@ func handleConnection(clientConn net.Conn, cfg Config) {
 
 	// ── Read initial HTTP payload ─────────────────────────────────────────
 	// 8 KiB is enough for even the most verbose custom/enhanced payloads.
-	clientConn.SetReadDeadline(time.Now().Add(initialReadTimeout))
+	if err := clientConn.SetReadDeadline(time.Now().Add(initialReadTimeout)); err != nil {
+		return
+	}
 	buf := make([]byte, 8192)
 	n, err := clientConn.Read(buf)
 	if err != nil {
 		return
 	}
-	clientConn.SetReadDeadline(time.Time{}) // clear – idle handled by doTransfer
+	_ = clientConn.SetReadDeadline(time.Time{}) // clear – idle handled by doTransfer
 	rawPayload := string(buf[:n])
 
 	// ── Resolve real client IP (behind CDN / Nginx) ───────────────────────
@@ -358,7 +360,7 @@ func handleConnection(clientConn net.Conn, cfg Config) {
 	authPass := getHeaderFromPayload(rawPayload, "X-Pass")
 	if cfg.Password != "" && authPass != cfg.Password {
 		logWarn("AUTH", fmt.Sprintf("[%s] Unauthorized from %s:%s", sessionID, realClientIP, realClientPort))
-		clientConn.Write([]byte("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"))
+		_, _ = clientConn.Write([]byte("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"))
 		return
 	}
 
@@ -372,7 +374,7 @@ func handleConnection(clientConn net.Conn, cfg Config) {
 	if err != nil {
 		logError("TUNNEL", fmt.Sprintf("[%s] Failed to reach %s from %s:%s – %v",
 			sessionID, targetHost, realClientIP, realClientPort, err))
-		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"))
+		_, _ = clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"))
 		return
 	}
 	defer targetConn.Close()
@@ -404,7 +406,7 @@ func handleConnection(clientConn net.Conn, cfg Config) {
 		sessionID, realClientIP, realClientPort, targetHost, proxyToSSHPort))
 
 	// ── WebSocket 101 handshake ───────────────────────────────────────────
-	clientConn.Write([]byte(buildWSHandshake(rawPayload)))
+	_, _ = clientConn.Write([]byte(buildWSHandshake(rawPayload)))
 
 	// ── Bidirectional pipe ────────────────────────────────────────────────
 	doTransfer(clientConn, targetConn, session)
@@ -450,8 +452,8 @@ func doTransfer(client, target net.Conn, session *SessionInfo) {
 	// refreshDeadline pushes the idle deadline forward on both ends.
 	refreshDeadline := func() {
 		d := time.Now().Add(idleTimeout)
-		client.SetDeadline(d)
-		target.SetDeadline(d)
+		_ = client.SetDeadline(d)
+		_ = target.SetDeadline(d)
 	}
 
 	// Set initial deadline
@@ -485,7 +487,7 @@ func doTransfer(client, target net.Conn, session *SessionInfo) {
 		}
 		// Graceful half-close: signal EOF to the other side
 		if tc, ok := dst.(*net.TCPConn); ok {
-			tc.CloseWrite()
+			_ = tc.CloseWrite()
 		} else {
 			dst.Close()
 		}
@@ -538,9 +540,9 @@ func setTCPOptions(conn net.Conn) {
 	if !ok {
 		return
 	}
-	tc.SetKeepAlive(true)
-	tc.SetKeepAlivePeriod(60 * time.Second) // probe every 60 s
-	tc.SetNoDelay(true)
+	_ = tc.SetKeepAlive(true)
+	_ = tc.SetKeepAlivePeriod(60 * time.Second) // probe every 60 s
+	_ = tc.SetNoDelay(true)
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -564,10 +566,8 @@ func getHeaderFromPayload(payload, key string) string {
 	return ""
 }
 
-// getHeader is kept for backward compatibility – it wraps getHeaderFromPayload.
-func getHeader(headers, key string) string {
-	return getHeaderFromPayload(headers, key)
-}
+
+
 
 // ═════════════════════════════════════════════════════════════════════════════
 // HTTP API server
@@ -596,7 +596,7 @@ func startAPIServer(port int) {
 	mux.HandleFunc("/api/users", cors(handleUsers))
 	mux.HandleFunc("/api/stats", cors(handleStats))
 	mux.HandleFunc("/health", cors(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(APIResponse{Success: true, Message: "OK"})
+		_ = json.NewEncoder(w).Encode(APIResponse{Success: true, Message: "OK"})
 	}))
 
 	addr := fmt.Sprintf(":%d", port)
@@ -618,7 +618,7 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	activeSessions.Range(func(_, _ interface{}) bool { active++; return true })
 	total := atomic.LoadInt64(&sessionCounter)
 	up := time.Since(serverStartTime)
-	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(APIResponse{Success: true, Data: map[string]interface{}{
 		"version":         Version,
 		"uptime":          up.String(),
 		"uptime_seconds":  int(up.Seconds()),
@@ -668,7 +668,7 @@ func handleSessions(w http.ResponseWriter, r *http.Request) {
 	})
 
 	total := atomic.LoadInt64(&sessionCounter)
-	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: SessionsResponse{
+	_ = json.NewEncoder(w).Encode(APIResponse{Success: true, Data: SessionsResponse{
 		TotalSessions:  total,
 		ActiveSessions: len(sessions),
 		ClosedSessions: total - int64(len(sessions)),
@@ -697,7 +697,7 @@ func handleActiveSessions(w http.ResponseWriter, r *http.Request) {
 		})
 		return true
 	})
-	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(APIResponse{Success: true, Data: map[string]interface{}{
 		"count": len(sessions), "sessions": sessions,
 	}})
 }
@@ -727,7 +727,7 @@ func handleUsers(w http.ResponseWriter, r *http.Request) {
 	for _, u := range userStats {
 		ul = append(ul, u)
 	}
-	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(APIResponse{Success: true, Data: map[string]interface{}{
 		"count": len(ul), "users": ul,
 	}})
 }
@@ -748,7 +748,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	})
 	total := atomic.LoadInt64(&sessionCounter)
 	up := time.Since(serverStartTime)
-	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: map[string]interface{}{
+	_ = json.NewEncoder(w).Encode(APIResponse{Success: true, Data: map[string]interface{}{
 		"uptime":          up.String(),
 		"uptime_seconds":  int(up.Seconds()),
 		"total_sessions":  total,
@@ -792,7 +792,7 @@ func authLogMonitor(ctx context.Context, authLogPath string) {
 	}
 	defer file.Close()
 
-	file.Seek(0, io.SeekEnd)
+	_, _ = file.Seek(0, io.SeekEnd)
 	reader := bufio.NewReader(file)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -1018,7 +1018,7 @@ func splitHostPort(addr string) (host, port string) {
 func generateSessionID() string {
 	n := atomic.AddInt64(&sessionCounter, 1)
 	b := make([]byte, 4)
-	rand.Read(b)
+	_, _ = rand.Read(b)
 	return fmt.Sprintf("%04d-%s", n, hex.EncodeToString(b)[:6])
 }
 
