@@ -1,0 +1,112 @@
+name: 🔄 Sync Go Modules
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Triggered setiap kali file .go berubah di branch utama.
+#  Job ini memastikan go.mod & go.sum selalu sinkron dengan source code
+#  lalu meng-commit perubahan kembali ke repo secara otomatis.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [main, master, develop]
+    paths:
+      - '**.go'           # file Go manapun berubah
+      - 'go.mod'          # atau go.mod itu sendiri diedit manual
+  workflow_dispatch:      # bisa dipanggil manual dari UI
+
+env:
+  GO_VERSION: '1.22'
+  MODULE_NAME: 'ssh-ws'
+
+permissions:
+  contents: write   # diperlukan untuk git push
+
+jobs:
+  sync-modules:
+    name: 📦 Sync go.mod & go.sum
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout dengan token yang punya write permission ──────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0           # perlu history untuk commit
+
+      # ── 2. Setup Go ───────────────────────────────────────────────────────
+      - name: Setup Go ${{ env.GO_VERSION }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      # ── 3. Init module jika belum ada, lalu tidy ─────────────────────────
+      - name: Initialize & tidy Go modules
+        run: |
+          # Buat go.mod jika belum ada (first-time setup)
+          if [ ! -f go.mod ]; then
+            echo "📌 go.mod not found — initializing module: ${{ env.MODULE_NAME }}"
+            go mod init ${{ env.MODULE_NAME }}
+          else
+            echo "✅ go.mod already exists, skipping init"
+          fi
+
+          # Sinkronkan dependency dari semua file .go
+          echo "🔄 Running go mod tidy..."
+          go mod tidy -v
+
+          echo ""
+          echo "── go.mod ────────────────────────────────────────"
+          cat go.mod
+          echo "──────────────────────────────────────────────────"
+
+      # ── 4. Verifikasi build setelah tidy ──────────────────────────────────
+      - name: Verify build
+        env:
+          CGO_ENABLED: 0
+        run: |
+          echo "🔨 Verifying build (linux/amd64)..."
+          GOOS=linux GOARCH=amd64 go build -o /dev/null .
+          echo "✅ Build OK"
+
+      # ── 5. Cek apakah ada perubahan di go.mod / go.sum ───────────────────
+      - name: Check for module changes
+        id: changes
+        run: |
+          git diff --quiet go.mod go.sum 2>/dev/null && \
+            git status --short | grep -qE "^(A|\?\?).*(go\.mod|go\.sum)" && \
+            CHANGED="true" || true
+
+          if git diff --quiet go.mod go.sum 2>/dev/null && \
+             ! git status --short | grep -qE "(go\.mod|go\.sum)"; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ No module changes detected"
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "📝 Module files changed:"
+            git status --short go.mod go.sum 2>/dev/null || true
+          fi
+
+      # ── 6. Commit & push perubahan ────────────────────────────────────────
+      - name: Commit updated modules
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add go.mod go.sum
+
+          CHANGED_FILES=$(git diff --cached --name-only | tr '\n' ' ')
+          git commit -m "chore(deps): sync go modules [skip ci]
+
+          Auto-updated by 'Sync Go Modules' workflow.
+          Changed: ${CHANGED_FILES}
+          Triggered by: ${{ github.actor }} @ ${{ github.sha }}"
+
+          git push origin HEAD:${{ github.ref_name }}
+          echo "✅ go.mod & go.sum pushed to ${{ github.ref_name }}"
+
+      - name: No changes
+        if: steps.changes.outputs.changed == 'false'
+        run: echo "✅ go.mod & go.sum are already up-to-date — nothing to commit."
