@@ -2,19 +2,14 @@ name: 🔨 Build
 
 on:
   push:
-    branches:
-      - main
-      - master
-      - develop
+    branches: [main, master, develop]
     paths-ignore:
       - '**.md'
       - 'docs/**'
       - '.gitignore'
       - 'LICENSE'
   pull_request:
-    branches:
-      - main
-      - master
+    branches: [main, master]
     paths-ignore:
       - '**.md'
       - 'docs/**'
@@ -29,12 +24,11 @@ on:
 env:
   APP_NAME: ssh-ws
   GO_VERSION: '1.22'
-  CGO_ENABLED: '0'
-  BUILD_FLAGS: '-ldflags "-s -w -X main.Credits=Risqi Nur Fadhilah -X main.Version=${{ github.ref_name }}"'
+  MODULE_NAME: 'ssh-ws'
 
 jobs:
   # ─────────────────────────────────────────────
-  #  Lint & Test
+  #  Lint & Vet
   # ─────────────────────────────────────────────
   lint:
     name: 🔍 Lint & Vet
@@ -43,7 +37,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Go
+      - name: Setup Go ${{ env.GO_VERSION }}
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -52,7 +46,8 @@ jobs:
       - name: Initialize Go module
         run: |
           if [ ! -f go.mod ]; then
-            go mod init ssh-ws
+            echo "📌 Initializing Go module: ${{ env.MODULE_NAME }}"
+            go mod init ${{ env.MODULE_NAME }}
           fi
           go mod tidy
 
@@ -70,215 +65,133 @@ jobs:
   #  Build Matrix
   # ─────────────────────────────────────────────
   build:
-    name: 🏗️ Build [${{ matrix.goos }}/${{ matrix.goarch }}]
+    name: 🏗️ Build [${{ matrix.label }}]
     needs: lint
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # ── Linux ──────────────────────────────
-          - goos: linux
-            goarch: amd64
-            runner: ubuntu-latest
-            ext: ''
-            label: 'linux-amd64'
-
-          - goos: linux
-            goarch: arm64
-            runner: ubuntu-latest
-            ext: ''
-            label: 'linux-arm64'
-
-          - goos: linux
-            goarch: arm
-            goarm: '7'
-            runner: ubuntu-latest
-            ext: ''
-            label: 'linux-armv7'
-
-          - goos: linux
-            goarch: arm
-            goarm: '6'
-            runner: ubuntu-latest
-            ext: ''
-            label: 'linux-armv6'
-
-          - goos: linux
-            goarch: '386'
-            runner: ubuntu-latest
-            ext: ''
-            label: 'linux-386'
-
-          - goos: linux
-            goarch: mips
-            gomips: 'softfloat'
-            runner: ubuntu-latest
-            ext: ''
-            label: 'linux-mips-softfloat'
-
-          - goos: linux
-            goarch: mipsle
-            gomips: 'softfloat'
-            runner: ubuntu-latest
-            ext: ''
-            label: 'linux-mipsle-softfloat'
-
-          - goos: linux
-            goarch: mips64
-            runner: ubuntu-latest
-            ext: ''
-            label: 'linux-mips64'
-
-          - goos: linux
-            goarch: mips64le
-            runner: ubuntu-latest
-            ext: ''
-            label: 'linux-mips64le'
-
-          - goos: linux
-            goarch: riscv64
-            runner: ubuntu-latest
-            ext: ''
-            label: 'linux-riscv64'
-
-          # ── Windows ────────────────────────────
-          - goos: windows
-            goarch: amd64
-            runner: ubuntu-latest
-            ext: '.exe'
-            label: 'windows-amd64'
-
-          - goos: windows
-            goarch: arm64
-            runner: ubuntu-latest
-            ext: '.exe'
-            label: 'windows-arm64'
-
-          - goos: windows
-            goarch: '386'
-            runner: ubuntu-latest
-            ext: '.exe'
-            label: 'windows-386'
-
-          # ── macOS ──────────────────────────────
-          - goos: darwin
-            goarch: amd64
-            runner: macos-latest
-            ext: ''
-            label: 'darwin-amd64'
-
-          - goos: darwin
-            goarch: arm64
-            runner: macos-latest
-            ext: ''
-            label: 'darwin-arm64'
-
-          # ── FreeBSD ────────────────────────────
-          - goos: freebsd
-            goarch: amd64
-            runner: ubuntu-latest
-            ext: ''
-            label: 'freebsd-amd64'
-
-          - goos: freebsd
-            goarch: arm64
-            runner: ubuntu-latest
-            ext: ''
-            label: 'freebsd-arm64'
-
-          # ── OpenBSD ────────────────────────────
-          - goos: openbsd
-            goarch: amd64
-            runner: ubuntu-latest
-            ext: ''
-            label: 'openbsd-amd64'
+          # ── Linux ──────────────────────────────────────────────────────────
+          - { goos: linux,   goarch: amd64,    runner: ubuntu-latest, ext: '',     label: linux-amd64          }
+          - { goos: linux,   goarch: arm64,    runner: ubuntu-latest, ext: '',     label: linux-arm64          }
+          - { goos: linux,   goarch: arm,      goarm: '7', runner: ubuntu-latest, ext: '', label: linux-armv7 }
+          - { goos: linux,   goarch: arm,      goarm: '6', runner: ubuntu-latest, ext: '', label: linux-armv6 }
+          - { goos: linux,   goarch: '386',    runner: ubuntu-latest, ext: '',     label: linux-386            }
+          - { goos: linux,   goarch: mips,     gomips: softfloat, runner: ubuntu-latest, ext: '', label: linux-mips-softfloat   }
+          - { goos: linux,   goarch: mipsle,   gomips: softfloat, runner: ubuntu-latest, ext: '', label: linux-mipsle-softfloat }
+          - { goos: linux,   goarch: mips64,   runner: ubuntu-latest, ext: '',     label: linux-mips64         }
+          - { goos: linux,   goarch: mips64le, runner: ubuntu-latest, ext: '',     label: linux-mips64le       }
+          - { goos: linux,   goarch: riscv64,  runner: ubuntu-latest, ext: '',     label: linux-riscv64        }
+          # ── Windows ────────────────────────────────────────────────────────
+          - { goos: windows, goarch: amd64,    runner: ubuntu-latest, ext: '.exe', label: windows-amd64        }
+          - { goos: windows, goarch: arm64,    runner: ubuntu-latest, ext: '.exe', label: windows-arm64        }
+          - { goos: windows, goarch: '386',    runner: ubuntu-latest, ext: '.exe', label: windows-386          }
+          # ── macOS ──────────────────────────────────────────────────────────
+          - { goos: darwin,  goarch: amd64,    runner: macos-latest,  ext: '',     label: darwin-amd64         }
+          - { goos: darwin,  goarch: arm64,    runner: macos-latest,  ext: '',     label: darwin-arm64         }
+          # ── BSD ────────────────────────────────────────────────────────────
+          - { goos: freebsd, goarch: amd64,    runner: ubuntu-latest, ext: '',     label: freebsd-amd64        }
+          - { goos: freebsd, goarch: arm64,    runner: ubuntu-latest, ext: '',     label: freebsd-arm64        }
+          - { goos: openbsd, goarch: amd64,    runner: ubuntu-latest, ext: '',     label: openbsd-amd64        }
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Go
+      - name: Setup Go ${{ env.GO_VERSION }}
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
 
+      # ── Version metadata ────────────────────────────────────────────────
       - name: Get version info
         id: version
         run: |
           VERSION="${{ github.ref_name }}"
-          if [[ "$VERSION" == "main" || "$VERSION" == "master" ]]; then
+          if [[ "$VERSION" == "main" || "$VERSION" == "master" || "$VERSION" == "develop" ]]; then
             VERSION="dev-$(git rev-parse --short HEAD)"
           fi
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}"            >> $GITHUB_OUTPUT
           echo "commit=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"  >> $GITHUB_OUTPUT
 
+      # ── Module init: idempotent (safe to run even if go.mod exists) ──────
       - name: Initialize Go module
         run: |
           if [ ! -f go.mod ]; then
-            go mod init ssh-ws
+            echo "📌 go.mod not found — running: go mod init ${{ env.MODULE_NAME }}"
+            go mod init ${{ env.MODULE_NAME }}
+          else
+            echo "✅ go.mod found ($(head -1 go.mod))"
           fi
           go mod tidy
+          echo "🗂️  go.mod contents:"
+          cat go.mod
 
+      # ── Build ────────────────────────────────────────────────────────────
       - name: Build binary
         id: build
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm }}
-          GOMIPS: ${{ matrix.gomips }}
+          GOOS:        ${{ matrix.goos }}
+          GOARCH:      ${{ matrix.goarch }}
+          GOARM:       ${{ matrix.goarm }}
+          GOMIPS:      ${{ matrix.gomips }}
           CGO_ENABLED: 0
         run: |
           OUTPUT="${{ env.APP_NAME }}-${{ matrix.label }}${{ matrix.ext }}"
+          mkdir -p dist
 
-          BUILD_LDFLAGS="-s -w"
-          BUILD_LDFLAGS="${BUILD_LDFLAGS} -X 'main.Version=${{ steps.version.outputs.version }}'"
-          BUILD_LDFLAGS="${BUILD_LDFLAGS} -X 'main.Credits=Risqi Nur Fadhilah'"
-          BUILD_LDFLAGS="${BUILD_LDFLAGS} -X 'main.BuildDate=${{ steps.version.outputs.date }}'"
-          BUILD_LDFLAGS="${BUILD_LDFLAGS} -X 'main.Commit=${{ steps.version.outputs.commit }}'"
+          LDFLAGS="-s -w"
+          LDFLAGS="${LDFLAGS} -X 'main.Version=${{ steps.version.outputs.version }}'"
+          LDFLAGS="${LDFLAGS} -X 'main.Credits=Risqi Nur Fadhilah'"
+          LDFLAGS="${LDFLAGS} -X 'main.BuildDate=${{ steps.version.outputs.date }}'"
+          LDFLAGS="${LDFLAGS} -X 'main.Commit=${{ steps.version.outputs.commit }}'"
 
-          echo "Building: ${OUTPUT}"
-          echo "  GOOS=${GOOS} GOARCH=${GOARCH} GOARM=${GOARM} GOMIPS=${GOMIPS}"
+          echo "🔨 Building: ${OUTPUT}"
+          echo "   GOOS=${GOOS} GOARCH=${GOARCH} GOARM=${GOARM:-n/a} GOMIPS=${GOMIPS:-n/a}"
 
           CGO_ENABLED=0 go build \
             -trimpath \
-            -ldflags "${BUILD_LDFLAGS}" \
+            -ldflags "${LDFLAGS}" \
             -o "dist/${OUTPUT}" \
             .
 
           echo "output=${OUTPUT}" >> $GITHUB_OUTPUT
           ls -lh "dist/${OUTPUT}"
 
+      # ── Smoke test (linux/amd64 only) ─────────────────────────────────
       - name: Verify binary
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
         run: |
-          if [[ "${{ matrix.goos }}" == "linux" && "${{ matrix.goarch }}" == "amd64" ]]; then
-            ./dist/${{ steps.build.outputs.output }} --help || true
-            file ./dist/${{ steps.build.outputs.output }}
-          fi
+          file "./dist/${{ steps.build.outputs.output }}"
+          ./dist/${{ steps.build.outputs.output }} --help 2>&1 || true
 
+      # ── Checksum ─────────────────────────────────────────────────────
       - name: Generate checksum
         run: |
           cd dist
-          sha256sum "${{ steps.build.outputs.output }}" > "${{ steps.build.outputs.output }}.sha256"
-          cat "${{ steps.build.outputs.output }}.sha256"
+          sha256sum "${{ steps.build.outputs.output }}" | \
+            tee "${{ steps.build.outputs.output }}.sha256"
 
+      # ── Compress ─────────────────────────────────────────────────────
       - name: Compress binary
+        id: compress
         run: |
           cd dist
-          OUTPUT="${{ steps.build.outputs.output }}"
-
+          OUT="${{ steps.build.outputs.output }}"
           if [[ "${{ matrix.goos }}" == "windows" ]]; then
-            zip "${OUTPUT%.exe}.zip" "${OUTPUT}" "${OUTPUT}.sha256"
-            echo "archive=${OUTPUT%.exe}.zip" >> $GITHUB_ENV
+            ARCHIVE="${OUT%.exe}.zip"
+            zip "${ARCHIVE}" "${OUT}" "${OUT}.sha256"
           else
-            tar -czf "${OUTPUT}.tar.gz" "${OUTPUT}" "${OUTPUT}.sha256"
-            echo "archive=${OUTPUT}.tar.gz" >> $GITHUB_ENV
+            ARCHIVE="${OUT}.tar.gz"
+            tar -czf "${ARCHIVE}" "${OUT}" "${OUT}.sha256"
           fi
+          echo "archive=${ARCHIVE}" >> $GITHUB_OUTPUT
+          ls -lh "${ARCHIVE}"
 
-          ls -lh
-
+      # ── Upload ────────────────────────────────────────────────────────
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -293,7 +206,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.APP_NAME }}-${{ matrix.label }}-compressed
-          path: dist/*.tar.gz
+          path: dist/${{ steps.compress.outputs.archive }}
           retention-days: 7
           if-no-files-found: ignore
 
@@ -319,19 +232,17 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Platform | Status | Size |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|--------|------|" >> $GITHUB_STEP_SUMMARY
-
           for dir in artifacts/*/; do
             name=$(basename "$dir")
             binary=$(find "$dir" -type f ! -name "*.sha256" | head -1)
             if [[ -f "$binary" ]]; then
               size=$(du -sh "$binary" | cut -f1)
-              echo "| \`$name\` | ✅ Success | $size |" >> $GITHUB_STEP_SUMMARY
+              echo "| \`${name}\` | ✅ | ${size} |" >> $GITHUB_STEP_SUMMARY
             else
-              echo "| \`$name\` | ❌ Failed | - |" >> $GITHUB_STEP_SUMMARY
+              echo "| \`${name}\` | ❌ | – |"       >> $GITHUB_STEP_SUMMARY
             fi
           done
-
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Branch**: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Triggered by**: \`${{ github.actor }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit**: \`${{ github.sha }}\`"          >> $GITHUB_STEP_SUMMARY
+          echo "**Branch**: \`${{ github.ref_name }}\`"     >> $GITHUB_STEP_SUMMARY
+          echo "**Actor** : \`${{ github.actor }}\`"        >> $GITHUB_STEP_SUMMARY
