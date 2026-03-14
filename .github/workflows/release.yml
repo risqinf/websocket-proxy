@@ -3,12 +3,12 @@ name: 🚀 Release
 on:
   push:
     tags:
-      - 'v*.*.*'           # v1.2.0
-      - 'v*.*.*-*'         # v1.2.0-stable, v1.2.0-beta
+      - 'v*.*.*'       # v1.3.0
+      - 'v*.*.*-*'     # v1.3.0-stable, v1.3.0-beta
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g. v1.2.0)'
+        description: 'Tag to release (e.g. v1.3.0)'
         required: true
         type: string
       prerelease:
@@ -23,25 +23,26 @@ on:
         type: boolean
 
 env:
-  APP_NAME: ssh-ws
-  GO_VERSION: '1.22'
+  APP_NAME:    ssh-ws
+  GO_VERSION:  '1.22'
+  MODULE_NAME: ssh-ws
 
 permissions:
   contents: write
   discussions: write
 
 jobs:
-  # ─────────────────────────────────────────────
-  #  Validate Tag & Prepare
-  # ─────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  #  1 · Prepare – extract metadata & generate changelog
+  # ─────────────────────────────────────────────────────────────────────────
   prepare:
     name: 📋 Prepare Release
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.meta.outputs.version }}
-      tag: ${{ steps.meta.outputs.tag }}
-      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
-      changelog: ${{ steps.changelog.outputs.content }}
+      version:      ${{ steps.meta.outputs.version }}
+      tag:          ${{ steps.meta.outputs.tag }}
+      is_prerelease:${{ steps.meta.outputs.is_prerelease }}
+      changelog:    ${{ steps.changelog.outputs.content }}
 
     steps:
       - name: Checkout
@@ -49,97 +50,70 @@ jobs:
         with:
           fetch-depth: 0
 
+      # ── Tag & version metadata ──────────────────────────────────────────
       - name: Extract release metadata
         id: meta
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           VERSION="${TAG#v}"
 
-          # Detect pre-release
           IS_PRE="false"
-          if [[ "$TAG" =~ -(alpha|beta|rc|dev|pre) ]] || [[ "${{ github.event.inputs.prerelease }}" == "true" ]]; then
+          if [[ "$TAG" =~ -(alpha|beta|rc|dev|pre) ]] || \
+             [[ "${{ github.event.inputs.prerelease }}" == "true" ]]; then
             IS_PRE="true"
           fi
 
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "is_prerelease=${IS_PRE}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}"               >> $GITHUB_OUTPUT
+          echo "version=${VERSION}"        >> $GITHUB_OUTPUT
+          echo "is_prerelease=${IS_PRE}"   >> $GITHUB_OUTPUT
 
-          echo "📌 Tag: ${TAG}"
-          echo "📦 Version: ${VERSION}"
-          echo "🔖 Pre-release: ${IS_PRE}"
+          echo "📌 Tag     : ${TAG}"
+          echo "📦 Version : ${VERSION}"
+          echo "🔖 Pre-rel : ${IS_PRE}"
 
+      # ── Auto-generate changelog from commit history ─────────────────────
       - name: Generate changelog
         id: changelog
         run: |
           TAG="${{ steps.meta.outputs.tag }}"
+          PREV=$(git tag --sort=-version:refname | grep -v "^${TAG}$" | head -1)
 
-          # Get previous tag
-          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${TAG}$" | head -1)
-
-          if [[ -z "$PREV_TAG" ]]; then
-            echo "No previous tag found, using all commits"
+          if [[ -z "$PREV" ]]; then
             COMMITS=$(git log --pretty=format:"- %s (%h)" | head -50)
           else
-            echo "Comparing ${TAG} to ${PREV_TAG}"
-            COMMITS=$(git log --pretty=format:"- %s (%h)" "${PREV_TAG}..HEAD")
+            COMMITS=$(git log --pretty=format:"- %s (%h)" "${PREV}..HEAD")
           fi
 
-          # Categorize commits
-          FEATURES=$(echo "$COMMITS" | grep -iE "^- (feat|add|new)" || true)
-          FIXES=$(echo "$COMMITS" | grep -iE "^- (fix|bug|patch|hotfix)" || true)
-          PERF=$(echo "$COMMITS" | grep -iE "^- (perf|optim|speed)" || true)
-          DOCS=$(echo "$COMMITS" | grep -iE "^- (doc|readme|changelog)" || true)
-          REFACTOR=$(echo "$COMMITS" | grep -iE "^- (refactor|clean|style)" || true)
-          OTHERS=$(echo "$COMMITS" | grep -viE "^- (feat|add|new|fix|bug|patch|hotfix|perf|optim|doc|readme|changelog|refactor|clean|style)" || true)
+          FEATURES=$(echo "$COMMITS" | grep -iE "^- (feat|add|new)"    || true)
+          FIXES=$(   echo "$COMMITS" | grep -iE "^- (fix|bug|patch)"   || true)
+          PERF=$(    echo "$COMMITS" | grep -iE "^- (perf|optim)"      || true)
+          REFACTOR=$(echo "$COMMITS" | grep -iE "^- (refactor|clean)"  || true)
+          DOCS=$(    echo "$COMMITS" | grep -iE "^- (doc|readme)"      || true)
+          OTHERS=$(  echo "$COMMITS" | grep -viE \
+            "^- (feat|add|new|fix|bug|patch|perf|optim|doc|readme|refactor|clean)" || true)
 
-          CONTENT="## 🚀 What's New in ${TAG}"$'\n\n'
+          C="## 🚀 What's New in ${TAG}"$'\n\n'
+          [[ -n "$FEATURES"  ]] && C+="### ✨ Features"$'\n'"$FEATURES"$'\n\n'
+          [[ -n "$FIXES"     ]] && C+="### 🐛 Bug Fixes"$'\n'"$FIXES"$'\n\n'
+          [[ -n "$PERF"      ]] && C+="### ⚡ Performance"$'\n'"$PERF"$'\n\n'
+          [[ -n "$REFACTOR"  ]] && C+="### 🔧 Improvements"$'\n'"$REFACTOR"$'\n\n'
+          [[ -n "$DOCS"      ]] && C+="### 📚 Docs"$'\n'"$DOCS"$'\n\n'
+          [[ -n "$OTHERS"    ]] && C+="### 🔄 Other"$'\n'"$OTHERS"$'\n\n'
+          [[ -n "$PREV"      ]] && \
+            C+="**Full Changelog**: [\`${PREV}...${TAG}\`](../../compare/${PREV}...${TAG})"$'\n\n'
+          C+="---"$'\n'
+          C+="_Built with Go ${{ env.GO_VERSION }} · Auto-generated by GitHub Actions_"
 
-          if [[ -n "$FEATURES" ]]; then
-            CONTENT+="### ✨ Features"$'\n'"$FEATURES"$'\n\n'
-          fi
-
-          if [[ -n "$FIXES" ]]; then
-            CONTENT+="### 🐛 Bug Fixes"$'\n'"$FIXES"$'\n\n'
-          fi
-
-          if [[ -n "$PERF" ]]; then
-            CONTENT+="### ⚡ Performance"$'\n'"$PERF"$'\n\n'
-          fi
-
-          if [[ -n "$REFACTOR" ]]; then
-            CONTENT+="### 🔧 Improvements"$'\n'"$REFACTOR"$'\n\n'
-          fi
-
-          if [[ -n "$DOCS" ]]; then
-            CONTENT+="### 📚 Documentation"$'\n'"$DOCS"$'\n\n'
-          fi
-
-          if [[ -n "$OTHERS" ]]; then
-            CONTENT+="### 🔄 Other Changes"$'\n'"$OTHERS"$'\n\n'
-          fi
-
-          if [[ -n "$PREV_TAG" ]]; then
-            CONTENT+="**Full Changelog**: [\`${PREV_TAG}...${TAG}\`](../../compare/${PREV_TAG}...${TAG})"$'\n\n'
-          fi
-
-          CONTENT+="---"$'\n'
-          CONTENT+="_Built with Go ${{ env.GO_VERSION }} · Auto-generated by GitHub Actions_"
-
-          # Save to file (avoid delimiter issues)
-          echo "$CONTENT" > /tmp/changelog.md
-          cat /tmp/changelog.md
-
-          # Output for next step
+          echo "$C" > /tmp/changelog.md
           {
             echo "content<<CHANGELOG_EOF"
             cat /tmp/changelog.md
             echo "CHANGELOG_EOF"
           } >> $GITHUB_OUTPUT
 
-  # ─────────────────────────────────────────────
-  #  Build All Platforms
-  # ─────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  #  2 · Build matrix
+  # ─────────────────────────────────────────────────────────────────────────
   build:
     name: 🏗️ Build [${{ matrix.label }}]
     needs: prepare
@@ -148,64 +122,76 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ── Linux ──────────────────────────────
-          - { goos: linux,   goarch: amd64,   runner: ubuntu-latest,  ext: '',     label: linux-amd64 }
-          - { goos: linux,   goarch: arm64,   runner: ubuntu-latest,  ext: '',     label: linux-arm64 }
-          - { goos: linux,   goarch: arm,     goarm: '7', runner: ubuntu-latest, ext: '', label: linux-armv7 }
-          - { goos: linux,   goarch: arm,     goarm: '6', runner: ubuntu-latest, ext: '', label: linux-armv6 }
-          - { goos: linux,   goarch: '386',   runner: ubuntu-latest,  ext: '',     label: linux-386 }
-          - { goos: linux,   goarch: mips,    gomips: softfloat, runner: ubuntu-latest, ext: '', label: linux-mips-softfloat }
-          - { goos: linux,   goarch: mipsle,  gomips: softfloat, runner: ubuntu-latest, ext: '', label: linux-mipsle-softfloat }
-          - { goos: linux,   goarch: mips64,  runner: ubuntu-latest,  ext: '',     label: linux-mips64 }
-          - { goos: linux,   goarch: mips64le,runner: ubuntu-latest,  ext: '',     label: linux-mips64le }
-          - { goos: linux,   goarch: riscv64, runner: ubuntu-latest,  ext: '',     label: linux-riscv64 }
-          # ── Windows ────────────────────────────
-          - { goos: windows, goarch: amd64,   runner: ubuntu-latest,  ext: '.exe', label: windows-amd64 }
-          - { goos: windows, goarch: arm64,   runner: ubuntu-latest,  ext: '.exe', label: windows-arm64 }
-          - { goos: windows, goarch: '386',   runner: ubuntu-latest,  ext: '.exe', label: windows-386 }
-          # ── macOS ──────────────────────────────
-          - { goos: darwin,  goarch: amd64,   runner: macos-latest,   ext: '',     label: darwin-amd64 }
-          - { goos: darwin,  goarch: arm64,   runner: macos-latest,   ext: '',     label: darwin-arm64 }
-          # ── BSD ────────────────────────────────
-          - { goos: freebsd, goarch: amd64,   runner: ubuntu-latest,  ext: '',     label: freebsd-amd64 }
-          - { goos: freebsd, goarch: arm64,   runner: ubuntu-latest,  ext: '',     label: freebsd-arm64 }
-          - { goos: openbsd, goarch: amd64,   runner: ubuntu-latest,  ext: '',     label: openbsd-amd64 }
+          # ── Linux ──────────────────────────────────────────────────────────
+          - { goos: linux,   goarch: amd64,    runner: ubuntu-latest, ext: '',     label: linux-amd64          }
+          - { goos: linux,   goarch: arm64,    runner: ubuntu-latest, ext: '',     label: linux-arm64          }
+          - { goos: linux,   goarch: arm,      goarm: '7', runner: ubuntu-latest, ext: '', label: linux-armv7 }
+          - { goos: linux,   goarch: arm,      goarm: '6', runner: ubuntu-latest, ext: '', label: linux-armv6 }
+          - { goos: linux,   goarch: '386',    runner: ubuntu-latest, ext: '',     label: linux-386            }
+          - { goos: linux,   goarch: mips,     gomips: softfloat, runner: ubuntu-latest, ext: '', label: linux-mips-softfloat   }
+          - { goos: linux,   goarch: mipsle,   gomips: softfloat, runner: ubuntu-latest, ext: '', label: linux-mipsle-softfloat }
+          - { goos: linux,   goarch: mips64,   runner: ubuntu-latest, ext: '',     label: linux-mips64         }
+          - { goos: linux,   goarch: mips64le, runner: ubuntu-latest, ext: '',     label: linux-mips64le       }
+          - { goos: linux,   goarch: riscv64,  runner: ubuntu-latest, ext: '',     label: linux-riscv64        }
+          # ── Windows ────────────────────────────────────────────────────────
+          - { goos: windows, goarch: amd64,    runner: ubuntu-latest, ext: '.exe', label: windows-amd64        }
+          - { goos: windows, goarch: arm64,    runner: ubuntu-latest, ext: '.exe', label: windows-arm64        }
+          - { goos: windows, goarch: '386',    runner: ubuntu-latest, ext: '.exe', label: windows-386          }
+          # ── macOS ──────────────────────────────────────────────────────────
+          - { goos: darwin,  goarch: amd64,    runner: macos-latest,  ext: '',     label: darwin-amd64         }
+          - { goos: darwin,  goarch: arm64,    runner: macos-latest,  ext: '',     label: darwin-arm64         }
+          # ── BSD ────────────────────────────────────────────────────────────
+          - { goos: freebsd, goarch: amd64,    runner: ubuntu-latest, ext: '',     label: freebsd-amd64        }
+          - { goos: freebsd, goarch: arm64,    runner: ubuntu-latest, ext: '',     label: freebsd-arm64        }
+          - { goos: openbsd, goarch: amd64,    runner: ubuntu-latest, ext: '',     label: openbsd-amd64        }
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Go
+      - name: Setup Go ${{ env.GO_VERSION }}
         uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: false
 
+      # ── Module init (idempotent) ────────────────────────────────────────
+      # Tidak pakai `go mod download` karena gagal tanpa go.mod.
+      # go mod tidy = init deps + prune unused sekaligus.
       - name: Initialize Go module
         run: |
           if [ ! -f go.mod ]; then
-            go mod init ssh-ws
+            echo "📌 Initializing module: ${{ env.MODULE_NAME }}"
+            go mod init ${{ env.MODULE_NAME }}
+          else
+            echo "✅ go.mod exists: $(head -1 go.mod)"
           fi
+          echo "🔄 Running go mod tidy..."
           go mod tidy
+          echo "── go.mod ──"
+          cat go.mod
 
+      # ── Build ────────────────────────────────────────────────────────────
       - name: Build binary
         id: build
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          GOARM: ${{ matrix.goarm }}
-          GOMIPS: ${{ matrix.gomips }}
+          GOOS:        ${{ matrix.goos }}
+          GOARCH:      ${{ matrix.goarch }}
+          GOARM:       ${{ matrix.goarm }}
+          GOMIPS:      ${{ matrix.gomips }}
           CGO_ENABLED: 0
         run: |
-          OUTPUT="${{ env.APP_NAME }}-${{ needs.prepare.outputs.tag }}-${{ matrix.label }}${{ matrix.ext }}"
+          TAG="${{ needs.prepare.outputs.tag }}"
+          OUTPUT="${{ env.APP_NAME }}-${TAG}-${{ matrix.label }}${{ matrix.ext }}"
+          mkdir -p dist
 
           LDFLAGS="-s -w"
-          LDFLAGS="${LDFLAGS} -X 'main.Version=${{ needs.prepare.outputs.tag }}'"
+          LDFLAGS="${LDFLAGS} -X 'main.Version=${TAG}'"
           LDFLAGS="${LDFLAGS} -X 'main.Credits=Risqi Nur Fadhilah'"
           LDFLAGS="${LDFLAGS} -X 'main.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)'"
           LDFLAGS="${LDFLAGS} -X 'main.Commit=$(git rev-parse --short HEAD)'"
 
-          mkdir -p dist
+          echo "🔨 Building: ${OUTPUT}"
 
           CGO_ENABLED=0 go build \
             -trimpath \
@@ -216,46 +202,47 @@ jobs:
           echo "output=${OUTPUT}" >> $GITHUB_OUTPUT
           ls -lh "dist/${OUTPUT}"
 
+      # ── Checksum ─────────────────────────────────────────────────────────
       - name: Generate checksum
         id: checksum
         run: |
           cd dist
-          OUTPUT="${{ steps.build.outputs.output }}"
-          sha256sum "${OUTPUT}" | tee "${OUTPUT}.sha256"
-          echo "sha256=$(sha256sum "${OUTPUT}" | awk '{print $1}')" >> $GITHUB_OUTPUT
+          OUT="${{ steps.build.outputs.output }}"
+          sha256sum "${OUT}" | tee "${OUT}.sha256"
+          echo "sha256=$(sha256sum "${OUT}" | awk '{print $1}')" >> $GITHUB_OUTPUT
 
+      # ── Archive ──────────────────────────────────────────────────────────
       - name: Create archive
         id: archive
         run: |
           cd dist
-          OUTPUT="${{ steps.build.outputs.output }}"
-          VERSION="${{ needs.prepare.outputs.tag }}"
-          LABEL="${{ matrix.label }}"
+          OUT="${{ steps.build.outputs.output }}"
+          TAG="${{ needs.prepare.outputs.tag }}"
 
-          # Create README for archive
           cat > README.txt << EOF
           ssh-ws (GO-TUNNEL PRO)
-          Version : ${VERSION}
-          Platform: ${LABEL}
+          Version : ${TAG}
+          Platform: ${{ matrix.label }}
           SHA256  : ${{ steps.checksum.outputs.sha256 }}
           Author  : Risqi Nur Fadhilah
           License : MIT
 
-          Usage: ./${OUTPUT} -p 8080 -t 127.0.0.1:22
+          Usage: ./${OUT} -p 2080 -t 127.0.0.1:22
           Docs  : https://github.com/risqinf/websocket-proxy
           EOF
 
           if [[ "${{ matrix.goos }}" == "windows" ]]; then
-            ARCHIVE="${{ env.APP_NAME }}-${VERSION}-${LABEL}.zip"
-            zip "${ARCHIVE}" "${OUTPUT}" "${OUTPUT}.sha256" README.txt
+            ARCHIVE="${{ env.APP_NAME }}-${TAG}-${{ matrix.label }}.zip"
+            zip "${ARCHIVE}" "${OUT}" "${OUT}.sha256" README.txt
           else
-            ARCHIVE="${{ env.APP_NAME }}-${VERSION}-${LABEL}.tar.gz"
-            tar -czf "${ARCHIVE}" "${OUTPUT}" "${OUTPUT}.sha256" README.txt
+            ARCHIVE="${{ env.APP_NAME }}-${TAG}-${{ matrix.label }}.tar.gz"
+            tar -czf "${ARCHIVE}" "${OUT}" "${OUT}.sha256" README.txt
           fi
 
           echo "archive=${ARCHIVE}" >> $GITHUB_OUTPUT
           ls -lh "${ARCHIVE}"
 
+      # ── Upload ────────────────────────────────────────────────────────────
       - name: Upload release artifact
         uses: actions/upload-artifact@v4
         with:
@@ -266,9 +253,9 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # ─────────────────────────────────────────────
-  #  Create GitHub Release
-  # ─────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  #  3 · Publish GitHub Release
+  # ─────────────────────────────────────────────────────────────────────────
   release:
     name: 📦 Publish Release
     needs: [prepare, build]
@@ -293,8 +280,8 @@ jobs:
 
       - name: Generate combined checksums
         run: |
-          find release-assets -name "*.sha256" -exec cat {} \; | sort > release-assets/checksums.txt
-          echo ""
+          find release-assets -name "*.sha256" -exec cat {} \; | sort \
+            > release-assets/checksums.txt
           echo "📋 checksums.txt:"
           cat release-assets/checksums.txt
 
@@ -330,30 +317,27 @@ jobs:
             | 🐡 OpenBSD | amd64 | `ssh-ws-${{ needs.prepare.outputs.tag }}-openbsd-amd64.tar.gz` |
 
             ## ✅ Verify Integrity
-
             ```bash
-            # Download and verify
             sha256sum -c checksums.txt
             ```
 
             ## ⚡ Quick Start
-
             ```bash
             # Linux/macOS
             tar -xzf ssh-ws-${{ needs.prepare.outputs.tag }}-linux-amd64.tar.gz
-            chmod +x ssh-ws-${{ needs.prepare.outputs.tag }}-linux-amd64
-            ./ssh-ws-${{ needs.prepare.outputs.tag }}-linux-amd64 -p 8080 -t 127.0.0.1:22
+            chmod +x ssh-ws-*-linux-amd64
+            ./ssh-ws-*-linux-amd64 -p 2080 -t 127.0.0.1:22
 
             # Windows (PowerShell)
             Expand-Archive ssh-ws-${{ needs.prepare.outputs.tag }}-windows-amd64.zip
-            .\ssh-ws-${{ needs.prepare.outputs.tag }}-windows-amd64.exe -p 8080 -t 127.0.0.1:22
+            .\ssh-ws-*-windows-amd64.exe -p 2080 -t 127.0.0.1:22
             ```
 
           files: |
             release-assets/**/*.tar.gz
             release-assets/**/*.zip
             release-assets/checksums.txt
-          draft: ${{ github.event.inputs.draft == 'true' }}
+          draft:      ${{ github.event.inputs.draft == 'true' }}
           prerelease: ${{ needs.prepare.outputs.is_prerelease == 'true' }}
           make_latest: ${{ needs.prepare.outputs.is_prerelease == 'false' }}
           fail_on_unmatched_files: false
@@ -363,15 +347,13 @@ jobs:
 
       - name: Release summary
         run: |
-          echo "# 🚀 Release Published!" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Tag**: \`${{ needs.prepare.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Version**: \`${{ needs.prepare.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "# 🚀 Release Published!"           >> $GITHUB_STEP_SUMMARY
+          echo ""                                   >> $GITHUB_STEP_SUMMARY
+          echo "**Tag**       : \`${{ needs.prepare.outputs.tag }}\`"     >> $GITHUB_STEP_SUMMARY
+          echo "**Version**   : \`${{ needs.prepare.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Pre-release**: \`${{ needs.prepare.outputs.is_prerelease }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "## 📦 Assets Published" >> $GITHUB_STEP_SUMMARY
+          echo ""                                   >> $GITHUB_STEP_SUMMARY
+          echo "## 📦 Assets Published"            >> $GITHUB_STEP_SUMMARY
           find release-assets -type f | sort | while read f; do
-            SIZE=$(du -sh "$f" | cut -f1)
-            NAME=$(basename "$f")
-            echo "- \`${NAME}\` (${SIZE})" >> $GITHUB_STEP_SUMMARY
+            echo "- \`$(basename "$f")\` ($(du -sh "$f" | cut -f1))" >> $GITHUB_STEP_SUMMARY
           done
