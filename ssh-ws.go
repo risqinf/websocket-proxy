@@ -23,18 +23,21 @@
  * Project      : GO-TUNNEL PRO
  * Developers   : Risqi Nur Fadhilah
  * Tester       : Rerechan02
- * Version      : v1.2-Stable
+ * Version      : v1.3-Stable
  * License      : MIT License
  * ----------------------------------------------------------------------------
  *
  * CMD Compile:
- * CGO_ENABLED=0 go build -ldflags "-s -w -X 'main.Credits=Risqi Nur Fadhilah' -X 'main.Version=v1.2-Stable'" -o ssh-ws
+ * CGO_ENABLED=0 go build -ldflags "-s -w \
+ *   -X 'main.Credits=Risqi Nur Fadhilah' \
+ *   -X 'main.Version=v1.3-Stable'" -o ssh-ws
  *
  * Requirements:
  * - Debian 11 / Ubuntu 22.04+
  * - Go version 1.22.0 or higher
  * - Dropbear or OpenSSH server
  * - Access to /var/log/auth.log
+ * - Nginx (optional, for CDN/reverse-proxy front-end)
  */
 
 package main
@@ -43,6 +46,8 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha1"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -65,10 +70,14 @@ import (
 	"github.com/mukswilly/udpgw"
 )
 
+// ─── Build-time variables ────────────────────────────────────────────────────
+
 var (
-	Version = "v2.6-Stable"
+	Version = "v1.3-Stable"
 	Credits = "Risqi Nur Fadhilah"
 )
+
+// ─── ANSI color codes ────────────────────────────────────────────────────────
 
 const (
 	ColorReset  = "\033[0m"
@@ -81,20 +90,44 @@ const (
 	ColorBlue   = "\033[34m"
 	ColorWhite  = "\033[97m"
 	ColorBold   = "\033[1m"
-	
-	PayloadResponse = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
 )
 
+// ─── Tunnel / WebSocket constants ────────────────────────────────────────────
+
+const (
+	// RFC 6455 §1.3 – magic GUID for Sec-WebSocket-Accept derivation
+	wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+	// idleTimeout: disconnect only after 1000 hours of absolute silence.
+	// SSH keepalives will reset this on every packet, so real sessions are
+	// effectively permanent while the SSH client is alive.
+	idleTimeout = 1000 * time.Hour
+
+	// initialReadTimeout: time allowed for the client to send its HTTP payload.
+	initialReadTimeout = 15 * time.Second
+
+	// dialTimeout: time allowed to reach the SSH backend.
+	dialTimeout = 10 * time.Second
+
+	// copyBuf: per-goroutine I/O buffer size.
+	copyBuf = 32 * 1024
+)
+
+// ─── Config ──────────────────────────────────────────────────────────────────
+
 type Config struct {
-	BindAddr     string
-	Port         int
-	Password     string
+	BindAddr    string
+	Port        int
+	Password    string
 	FallbackAddr string
-	LogFile      string
-	AuthLogPath  string
-	APIPort      int
+	LogFile     string
+	AuthLogPath string
+	APIPort     int
 }
 
+// ─── I/O helpers ─────────────────────────────────────────────────────────────
+
+// WriteCounter wraps an io.Writer and atomically counts bytes written.
 type WriteCounter struct {
 	Writer  io.Writer
 	Counter *int64
@@ -108,27 +141,29 @@ func (wc WriteCounter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// ─── Session types ───────────────────────────────────────────────────────────
+
 type SessionInfo struct {
-	ID               string    `json:"id"`
-	RealClientIP     string    `json:"real_client_ip"`
-	RealClientPort   string    `json:"real_client_port"`
-	ClientAddr       string    `json:"client_addr"`
-	ClientPort       string    `json:"client_port"`
-	TargetAddr       string    `json:"target_addr"`
-	TargetPort       string    `json:"target_port"`
-	ProxyToSSHPort   string    `json:"proxy_to_ssh_port"`
-	Username         string    `json:"username"`
-	SessionNumber    int       `json:"session_number"`
-	PID              int       `json:"pid"`
-	SSHType          string    `json:"ssh_type"`
-	StartTime        time.Time `json:"start_time"`
-	LastActivity     time.Time `json:"last_activity"`
-	TxBytes          int64     `json:"tx_bytes"`
-	RxBytes          int64     `json:"rx_bytes"`
-	Duration         string    `json:"duration"`
-	TxFormatted      string    `json:"tx_formatted"`
-	RxFormatted      string    `json:"rx_formatted"`
-	TotalFormatted   string    `json:"total_formatted"`
+	ID             string    `json:"id"`
+	RealClientIP   string    `json:"real_client_ip"`
+	RealClientPort string    `json:"real_client_port"`
+	ClientAddr     string    `json:"client_addr"`
+	ClientPort     string    `json:"client_port"`
+	TargetAddr     string    `json:"target_addr"`
+	TargetPort     string    `json:"target_port"`
+	ProxyToSSHPort string    `json:"proxy_to_ssh_port"`
+	Username       string    `json:"username"`
+	SessionNumber  int       `json:"session_number"`
+	PID            int       `json:"pid"`
+	SSHType        string    `json:"ssh_type"`
+	StartTime      time.Time `json:"start_time"`
+	LastActivity   time.Time `json:"last_activity"`
+	TxBytes        int64     `json:"tx_bytes"`
+	RxBytes        int64     `json:"rx_bytes"`
+	Duration       string    `json:"duration"`
+	TxFormatted    string    `json:"tx_formatted"`
+	RxFormatted    string    `json:"rx_formatted"`
+	TotalFormatted string    `json:"total_formatted"`
 }
 
 type APIResponse struct {
@@ -138,11 +173,11 @@ type APIResponse struct {
 }
 
 type SessionsResponse struct {
-	TotalSessions   int64                  `json:"total_sessions"`
-	ActiveSessions  int                    `json:"active_sessions"`
-	ClosedSessions  int64                  `json:"closed_sessions"`
-	Sessions        []SessionInfo          `json:"sessions"`
-	UserStats       map[string]UserStats   `json:"user_stats"`
+	TotalSessions  int64                `json:"total_sessions"`
+	ActiveSessions int                  `json:"active_sessions"`
+	ClosedSessions int64                `json:"closed_sessions"`
+	Sessions       []SessionInfo        `json:"sessions"`
+	UserStats      map[string]UserStats `json:"user_stats"`
 }
 
 type UserStats struct {
@@ -156,6 +191,8 @@ type UserStats struct {
 	TotalFormatted string `json:"total_formatted"`
 }
 
+// ─── Global state ────────────────────────────────────────────────────────────
+
 var (
 	activeSessions   sync.Map
 	sessionCounter   int64
@@ -163,9 +200,12 @@ var (
 	serverStartTime  time.Time
 )
 
+// ═════════════════════════════════════════════════════════════════════════════
+// main
+// ═════════════════════════════════════════════════════════════════════════════
+
 func main() {
 	cfg := setupFlags()
-	
 	setupLogger(cfg.LogFile)
 	serverStartTime = time.Now()
 
@@ -179,9 +219,9 @@ func main() {
 	}
 
 	go sessionMonitor(ctx)
-	
 	go authLogMonitor(ctx, cfg.AuthLogPath)
 
+	// UDPGW multiplexer
 	go func() {
 		configJSON := fmt.Sprintf(`{
 			"LogLevel": "info",
@@ -190,7 +230,7 @@ func main() {
 			"UdpgwPort": 7300,
 			"DNSResolverIPAddress": "1.1.1.1"
 		}`, cfg.LogFile)
-		
+
 		logInfo("UDPGW", "Initializing Multiplexer on port 7300...")
 		if err := udpgw.StartServer([]byte(configJSON)); err != nil {
 			logError("UDPGW", fmt.Sprintf("Service Error: %v", err))
@@ -229,279 +269,120 @@ func main() {
 	logInfo("SYSTEM", "Server halted successfully.")
 }
 
-func startAPIServer(port int) {
-	mux := http.NewServeMux()
-	
-	corsMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-			w.Header().Set("Content-Type", "application/json")
-			
-			if r.Method == "OPTIONS" {
-				w.WriteHeader(http.StatusOK)
-				return
-			}
-			next(w, r)
-		}
+// ═════════════════════════════════════════════════════════════════════════════
+// WebSocket helpers
+// ═════════════════════════════════════════════════════════════════════════════
+
+// buildWSHandshake constructs a valid RFC 6455 HTTP/1.1 101 response.
+//
+// It scans the *entire* raw payload (including split/custom payloads that
+// contain more than one HTTP request block) to locate:
+//   - Sec-WebSocket-Key  → used to compute Sec-WebSocket-Accept
+//   - Sec-WebSocket-Protocol → echoed back if present
+//
+// If no key is found (plain-HTTP or non-WS client) a minimal 101 is returned
+// so the tunnel still works.
+func buildWSHandshake(rawPayload string) string {
+	key := getHeaderFromPayload(rawPayload, "Sec-WebSocket-Key")
+
+	if key == "" {
+		// Fallback – no WS key present (direct TCP / custom payload without key)
+		return "HTTP/1.1 101 Switching Protocols\r\n" +
+			"Upgrade: websocket\r\n" +
+			"Connection: Upgrade\r\n\r\n"
 	}
-	
-	mux.HandleFunc("/api/status", corsMiddleware(handleStatus))
-	mux.HandleFunc("/api/sessions", corsMiddleware(handleSessions))
-	mux.HandleFunc("/api/sessions/active", corsMiddleware(handleActiveSessions))
-	mux.HandleFunc("/api/users", corsMiddleware(handleUsers))
-	mux.HandleFunc("/api/stats", corsMiddleware(handleStats))
-	mux.HandleFunc("/health", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(APIResponse{Success: true, Message: "OK"})
-	}))
-	
-	addr := fmt.Sprintf(":%d", port)
-	logInfo("API", fmt.Sprintf("HTTP API listening on %s%s%s", ColorCyan, addr, ColorReset))
-	
-	server := &http.Server{
-		Addr:         addr,
-		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+
+	// SHA1(key + GUID) → base64  (RFC 6455 §4.2.2)
+	h := sha1.New()
+	h.Write([]byte(strings.TrimSpace(key) + wsGUID))
+	accept := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	var sb strings.Builder
+	sb.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
+	sb.WriteString("Upgrade: websocket\r\n")
+	sb.WriteString("Connection: Upgrade\r\n")
+	sb.WriteString("Sec-WebSocket-Accept: " + accept + "\r\n")
+
+	// Echo first sub-protocol if offered
+	if proto := getHeaderFromPayload(rawPayload, "Sec-WebSocket-Protocol"); proto != "" {
+		first := strings.TrimSpace(strings.SplitN(proto, ",", 2)[0])
+		sb.WriteString("Sec-WebSocket-Protocol: " + first + "\r\n")
 	}
-	
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		logError("API", fmt.Sprintf("Server error: %v", err))
-	}
+
+	sb.WriteString("\r\n")
+	return sb.String()
 }
 
-func handleStatus(w http.ResponseWriter, r *http.Request) {
-	activeCount := 0
-	activeSessions.Range(func(key, value interface{}) bool {
-		activeCount++
-		return true
-	})
-	
-	totalSessions := atomic.LoadInt64(&sessionCounter)
-	uptime := time.Since(serverStartTime)
-	
-	data := map[string]interface{}{
-		"version":         Version,
-		"uptime":          uptime.String(),
-		"uptime_seconds":  int(uptime.Seconds()),
-		"total_sessions":  totalSessions,
-		"active_sessions": activeCount,
-		"closed_sessions": totalSessions - int64(activeCount),
-	}
-	
-	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: data})
-}
-
-func handleSessions(w http.ResponseWriter, r *http.Request) {
-	sessions := []SessionInfo{}
-	userStats := make(map[string]UserStats)
-	
-	activeSessions.Range(func(key, value interface{}) bool {
-		session := value.(*SessionInfo)
-		duration := time.Since(session.StartTime)
-		txBytes := atomic.LoadInt64(&session.TxBytes)
-		rxBytes := atomic.LoadInt64(&session.RxBytes)
-		
-		sessionInfo := SessionInfo{
-			ID:             session.ID,
-			RealClientIP:   session.RealClientIP,
-			RealClientPort: session.RealClientPort,
-			Username:       session.Username,
-			SessionNumber:  session.SessionNumber,
-			PID:            session.PID,
-			SSHType:        session.SSHType,
-			StartTime:      session.StartTime,
-			TxBytes:        txBytes,
-			RxBytes:        rxBytes,
-			Duration:       duration.Round(time.Second).String(),
-			TxFormatted:    formatBytes(txBytes),
-			RxFormatted:    formatBytes(rxBytes),
-			TotalFormatted: formatBytes(txBytes + rxBytes),
-		}
-		sessions = append(sessions, sessionInfo)
-		
-		if session.Username != "detecting..." && session.Username != "" {
-			stats := userStats[session.Username]
-			stats.Username = session.Username
-			stats.SessionCount++
-			stats.TotalTX += txBytes
-			stats.TotalRX += rxBytes
-			stats.TotalBytes = stats.TotalTX + stats.TotalRX
-			stats.TxFormatted = formatBytes(stats.TotalTX)
-			stats.RxFormatted = formatBytes(stats.TotalRX)
-			stats.TotalFormatted = formatBytes(stats.TotalBytes)
-			userStats[session.Username] = stats
-		}
-		
-		return true
-	})
-	
-	totalSessions := atomic.LoadInt64(&sessionCounter)
-	response := SessionsResponse{
-		TotalSessions:  totalSessions,
-		ActiveSessions: len(sessions),
-		ClosedSessions: totalSessions - int64(len(sessions)),
-		Sessions:       sessions,
-		UserStats:      userStats,
-	}
-	
-	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: response})
-}
-
-func handleActiveSessions(w http.ResponseWriter, r *http.Request) {
-	sessions := []SessionInfo{}
-	
-	activeSessions.Range(func(key, value interface{}) bool {
-		session := value.(*SessionInfo)
-		duration := time.Since(session.StartTime)
-		txBytes := atomic.LoadInt64(&session.TxBytes)
-		rxBytes := atomic.LoadInt64(&session.RxBytes)
-		
-		sessionInfo := SessionInfo{
-			ID:             session.ID,
-			RealClientIP:   session.RealClientIP,
-			Username:       session.Username,
-			SessionNumber:  session.SessionNumber,
-			PID:            session.PID,
-			SSHType:        session.SSHType,
-			Duration:       duration.Round(time.Second).String(),
-			TxFormatted:    formatBytes(txBytes),
-			RxFormatted:    formatBytes(rxBytes),
-			TotalFormatted: formatBytes(txBytes + rxBytes),
-		}
-		sessions = append(sessions, sessionInfo)
-		return true
-	})
-	
-	json.NewEncoder(w).Encode(APIResponse{
-		Success: true,
-		Data:    map[string]interface{}{"count": len(sessions), "sessions": sessions},
-	})
-}
-
-func handleUsers(w http.ResponseWriter, r *http.Request) {
-	userStats := make(map[string]UserStats)
-	
-	activeSessions.Range(func(key, value interface{}) bool {
-		session := value.(*SessionInfo)
-		if session.Username != "detecting..." && session.Username != "" {
-			txBytes := atomic.LoadInt64(&session.TxBytes)
-			rxBytes := atomic.LoadInt64(&session.RxBytes)
-			
-			stats := userStats[session.Username]
-			stats.Username = session.Username
-			stats.SessionCount++
-			stats.TotalTX += txBytes
-			stats.TotalRX += rxBytes
-			stats.TotalBytes = stats.TotalTX + stats.TotalRX
-			stats.TxFormatted = formatBytes(stats.TotalTX)
-			stats.RxFormatted = formatBytes(stats.TotalRX)
-			stats.TotalFormatted = formatBytes(stats.TotalBytes)
-			userStats[session.Username] = stats
-		}
-		return true
-	})
-	
-	userList := []UserStats{}
-	for _, stats := range userStats {
-		userList = append(userList, stats)
-	}
-	
-	json.NewEncoder(w).Encode(APIResponse{
-		Success: true,
-		Data:    map[string]interface{}{"count": len(userList), "users": userList},
-	})
-}
-
-func handleStats(w http.ResponseWriter, r *http.Request) {
-	var totalTX, totalRX int64
-	activeCount := 0
-	userCounts := make(map[string]int)
-	
-	activeSessions.Range(func(key, value interface{}) bool {
-		activeCount++
-		session := value.(*SessionInfo)
-		totalTX += atomic.LoadInt64(&session.TxBytes)
-		totalRX += atomic.LoadInt64(&session.RxBytes)
-		
-		if session.Username != "detecting..." && session.Username != "" {
-			userCounts[session.Username]++
-		}
-		return true
-	})
-	
-	totalSessions := atomic.LoadInt64(&sessionCounter)
-	uptime := time.Since(serverStartTime)
-	
-	data := map[string]interface{}{
-		"uptime":           uptime.String(),
-		"uptime_seconds":   int(uptime.Seconds()),
-		"total_sessions":   totalSessions,
-		"active_sessions":  activeCount,
-		"closed_sessions":  totalSessions - int64(activeCount),
-		"total_tx":         totalTX,
-		"total_rx":         totalRX,
-		"total_bytes":      totalTX + totalRX,
-		"tx_formatted":     formatBytes(totalTX),
-		"rx_formatted":     formatBytes(totalRX),
-		"total_formatted":  formatBytes(totalTX + totalRX),
-		"unique_users":     len(userCounts),
-		"users_breakdown":  userCounts,
-	}
-	
-	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: data})
-}
+// ═════════════════════════════════════════════════════════════════════════════
+// Connection handling
+// ═════════════════════════════════════════════════════════════════════════════
 
 func handleConnection(clientConn net.Conn, cfg Config) {
 	defer clientConn.Close()
+
+	// Apply TCP-level tuning immediately
+	setTCPOptions(clientConn)
 
 	sessionID := generateSessionID()
 	clientAddr := clientConn.RemoteAddr().String()
 	clientIP, clientPort := splitHostPort(clientAddr)
 
-	clientConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	buf := make([]byte, 4096)
+	// ── Read initial HTTP payload ─────────────────────────────────────────
+	// 8 KiB is enough for even the most verbose custom/enhanced payloads.
+	clientConn.SetReadDeadline(time.Now().Add(initialReadTimeout))
+	buf := make([]byte, 8192)
 	n, err := clientConn.Read(buf)
-	if err != nil { 
-		return 
+	if err != nil {
+		return
 	}
-	
-	clientConn.SetReadDeadline(time.Time{})
+	clientConn.SetReadDeadline(time.Time{}) // clear – idle handled by doTransfer
+	rawPayload := string(buf[:n])
 
-	rawHeaders := string(buf[:n])
-	
-	realClientIP := clientIP
+	// ── Resolve real client IP (behind CDN / Nginx) ───────────────────────
+	realClientIP   := clientIP
 	realClientPort := clientPort
-	
-	targetHost := getHeader(rawHeaders, "X-Real-Host")
-	if targetHost == "" { 
-		targetHost = cfg.FallbackAddr 
+
+	if xfwd := getHeaderFromPayload(rawPayload, "X-Forwarded-For"); xfwd != "" {
+		realClientIP = strings.TrimSpace(strings.SplitN(xfwd, ",", 2)[0])
+	} else if xrip := getHeaderFromPayload(rawPayload, "X-Real-IP"); xrip != "" {
+		realClientIP = xrip
 	}
 
-	authPass := getHeader(rawHeaders, "X-Pass")
+	// ── Target resolution ─────────────────────────────────────────────────
+	targetHost := getHeaderFromPayload(rawPayload, "X-Real-Host")
+	if targetHost == "" {
+		targetHost = cfg.FallbackAddr
+	}
+
+	// ── Optional password auth ────────────────────────────────────────────
+	authPass := getHeaderFromPayload(rawPayload, "X-Pass")
 	if cfg.Password != "" && authPass != cfg.Password {
 		logWarn("AUTH", fmt.Sprintf("[%s] Unauthorized from %s:%s", sessionID, realClientIP, realClientPort))
-		clientConn.Write([]byte("HTTP/1.1 401 Unauthorized\r\n\r\n"))
+		clientConn.Write([]byte("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n"))
 		return
 	}
 
-	if !strings.Contains(targetHost, ":") { 
-		targetHost += ":22" 
+	if !strings.Contains(targetHost, ":") {
+		targetHost += ":22"
 	}
 	_, targetPort := splitHostPort(targetHost)
 
-	targetConn, err := net.DialTimeout("tcp", targetHost, 10*time.Second)
+	// ── Dial SSH backend ──────────────────────────────────────────────────
+	targetConn, err := net.DialTimeout("tcp", targetHost, dialTimeout)
 	if err != nil {
-		logError("TUNNEL", fmt.Sprintf("[%s] Failed to reach %s from %s:%s", sessionID, targetHost, realClientIP, realClientPort))
-		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		logError("TUNNEL", fmt.Sprintf("[%s] Failed to reach %s from %s:%s – %v",
+			sessionID, targetHost, realClientIP, realClientPort, err))
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"))
 		return
 	}
 	defer targetConn.Close()
 
+	setTCPOptions(targetConn)
+
 	proxyLocalAddr := targetConn.LocalAddr().String()
 	_, proxyToSSHPort := splitHostPort(proxyLocalAddr)
 
+	// ── Register session ──────────────────────────────────────────────────
 	session := &SessionInfo{
 		ID:             sessionID,
 		RealClientIP:   realClientIP,
@@ -512,8 +393,6 @@ func handleConnection(clientConn net.Conn, cfg Config) {
 		TargetPort:     targetPort,
 		ProxyToSSHPort: proxyToSSHPort,
 		Username:       "detecting...",
-		SessionNumber:  0,
-		PID:            0,
 		SSHType:        "unknown",
 		StartTime:      time.Now(),
 		LastActivity:   time.Now(),
@@ -521,145 +400,403 @@ func handleConnection(clientConn net.Conn, cfg Config) {
 	activeSessions.Store(sessionID, session)
 	sshPortToSession.Store(proxyToSSHPort, sessionID)
 
-	logSuccess("CONNECT", fmt.Sprintf("[%s] %s:%s -> %s (proxy port:%s)", 
+	logSuccess("CONNECT", fmt.Sprintf("[%s] %s:%s → %s  (proxy-port:%s)",
 		sessionID, realClientIP, realClientPort, targetHost, proxyToSSHPort))
-	
-	clientConn.Write([]byte(PayloadResponse))
 
+	// ── WebSocket 101 handshake ───────────────────────────────────────────
+	clientConn.Write([]byte(buildWSHandshake(rawPayload)))
+
+	// ── Bidirectional pipe ────────────────────────────────────────────────
 	doTransfer(clientConn, targetConn, session)
 	sshPortToSession.Delete(proxyToSSHPort)
 }
 
-func getNextSessionNumber(username string) int {
-	if username == "" || username == "detecting..." {
-		return 0
-	}
-	
-	maxNum := 0
-	activeSessions.Range(func(key, value interface{}) bool {
-		session := value.(*SessionInfo)
-		if session.Username == username && session.SessionNumber > maxNum {
-			maxNum = session.SessionNumber
-		}
-		return true
-	})
-	
-	return maxNum + 1
-}
-
-func formatUserDisplay(username string, sessionNumber int, pid int) string {
-	userInfo := username
-	
-	if username != "detecting..." && username != "" && sessionNumber > 0 {
-		userInfo = fmt.Sprintf("%s-%d", username, sessionNumber)
-	}
-	
-	if pid > 0 {
-		userInfo = fmt.Sprintf("%s (PID:%d)", userInfo, pid)
-	}
-	
-	return userInfo
-}
-
+// doTransfer pipes data between client↔SSH with:
+//   - 1000-hour idle timeout (refreshed on every chunk of data)
+//   - per-direction byte counters
+//   - graceful half-close on EOF
+//   - clean shutdown on any side's error
 func doTransfer(client, target net.Conn, session *SessionInfo) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	stopMonitor := make(chan bool)
+	stopMonitor := make(chan struct{})
 
+	// ── Background monitor ────────────────────────────────────────────────
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
-		
 		for {
 			select {
 			case <-stopMonitor:
 				return
 			case <-ticker.C:
-				currTx := atomic.LoadInt64(&session.TxBytes)
-				currRx := atomic.LoadInt64(&session.RxBytes)
-				if currTx > 0 || currRx > 0 {
+				tx := atomic.LoadInt64(&session.TxBytes)
+				rx := atomic.LoadInt64(&session.RxBytes)
+				if tx > 0 || rx > 0 {
 					session.LastActivity = time.Now()
-					duration := time.Since(session.StartTime).Round(time.Second)
-					
-					userInfo := formatUserDisplay(session.Username, session.SessionNumber, session.PID)
-					totalBytes := currTx + currRx
-					
-					log.Printf("%s[MONITOR]%s [%s] %s:%s | User: %s | Duration: %v | TX: %s | RX: %s | Total: %s", 
-						ColorPurple, ColorReset, session.ID, session.RealClientIP, session.RealClientPort,
-						userInfo, duration, formatBytes(currTx), formatBytes(currRx), formatBytes(totalBytes))
+					dur := time.Since(session.StartTime).Round(time.Second)
+					ui := formatUserDisplay(session.Username, session.SessionNumber, session.PID)
+					log.Printf("%s[MONITOR]%s [%s] %s:%s | %s | up:%v | TX:%s RX:%s Total:%s",
+						ColorPurple, ColorReset,
+						session.ID, session.RealClientIP, session.RealClientPort,
+						ui, dur,
+						formatBytes(tx), formatBytes(rx), formatBytes(tx+rx))
 				}
 			}
 		}
 	}()
 
-	go func() {
-		defer wg.Done()
-		io.Copy(WriteCounter{target, &session.TxBytes}, client)
-		if t, ok := target.(*net.TCPConn); ok { 
-			t.CloseWrite() 
-		}
-	}()
+	// refreshDeadline pushes the idle deadline forward on both ends.
+	refreshDeadline := func() {
+		d := time.Now().Add(idleTimeout)
+		client.SetDeadline(d)
+		target.SetDeadline(d)
+	}
 
-	go func() {
+	// Set initial deadline
+	refreshDeadline()
+
+	// ── copyHalf pipes src→dst, counting bytes ────────────────────────────
+	copyHalf := func(dst, src net.Conn, counter *int64) {
 		defer wg.Done()
-		io.Copy(WriteCounter{client, &session.RxBytes}, target)
-		if c, ok := client.(*net.TCPConn); ok { 
-			c.CloseWrite() 
+		buf := make([]byte, copyBuf)
+		for {
+			nr, rerr := src.Read(buf)
+			if nr > 0 {
+				nw, werr := dst.Write(buf[:nr])
+				if nw > 0 {
+					atomic.AddInt64(counter, int64(nw))
+					refreshDeadline() // activity → reset idle timer
+				}
+				if werr != nil {
+					if !isConnClosed(werr) {
+						logWarn("TUNNEL", fmt.Sprintf("[%s] write error: %v", session.ID, werr))
+					}
+					break
+				}
+			}
+			if rerr != nil {
+				if rerr != io.EOF && !isConnClosed(rerr) {
+					logWarn("TUNNEL", fmt.Sprintf("[%s] read error: %v", session.ID, rerr))
+				}
+				break
+			}
 		}
-	}()
+		// Graceful half-close: signal EOF to the other side
+		if tc, ok := dst.(*net.TCPConn); ok {
+			tc.CloseWrite()
+		} else {
+			dst.Close()
+		}
+	}
+
+	go copyHalf(target, client, &session.TxBytes) // client → SSH
+	go copyHalf(client, target, &session.RxBytes) // SSH → client
 
 	wg.Wait()
-	stopMonitor <- true
-	
-	duration := time.Since(session.StartTime).Round(time.Second)
-	totalTx := atomic.LoadInt64(&session.TxBytes)
-	totalRx := atomic.LoadInt64(&session.RxBytes)
-	totalBytes := totalTx + totalRx
-	
-	userInfo := formatUserDisplay(session.Username, session.SessionNumber, session.PID)
-	
-	log.Printf("%s[END]%s [%s] %s:%s | User: %s%s%s | Duration: %v | TX: %s | RX: %s | Total: %s", 
-		ColorGray, ColorReset, session.ID, session.RealClientIP, session.RealClientPort,
-		ColorBold, userInfo, ColorReset,
-		duration, formatBytes(totalTx), formatBytes(totalRx), 
-		formatBytes(totalBytes))
-	
+	close(stopMonitor)
+
+	// ── Session end log ───────────────────────────────────────────────────
+	dur   := time.Since(session.StartTime).Round(time.Second)
+	tx    := atomic.LoadInt64(&session.TxBytes)
+	rx    := atomic.LoadInt64(&session.RxBytes)
+	ui    := formatUserDisplay(session.Username, session.SessionNumber, session.PID)
+
+	log.Printf("%s[END]%s [%s] %s:%s | User: %s%s%s | up:%v | TX:%s RX:%s Total:%s",
+		ColorGray, ColorReset,
+		session.ID, session.RealClientIP, session.RealClientPort,
+		ColorBold, ui, ColorReset,
+		dur, formatBytes(tx), formatBytes(rx), formatBytes(tx+rx))
+
 	activeSessions.Delete(session.ID)
 }
 
+// isConnClosed returns true for expected/benign network errors so we don't
+// spam the log on normal connection teardown.
+func isConnClosed(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return err == io.EOF ||
+		strings.Contains(s, "use of closed network connection") ||
+		strings.Contains(s, "connection reset by peer") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "EOF") ||
+		strings.Contains(s, "i/o timeout")
+}
+
+// setTCPOptions enables keepalive and disables Nagle on a TCP connection.
+// Both are essential for long-lived SSH tunnels:
+//   - KeepAlive: OS sends probes so dead peers are detected without application
+//     data, preventing half-open connections from persisting forever.
+//   - NoDelay: eliminates 40 ms Nagle delay on small SSH packets (interactive
+//     typing feels instant).
+func setTCPOptions(conn net.Conn) {
+	tc, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	tc.SetKeepAlive(true)
+	tc.SetKeepAlivePeriod(60 * time.Second) // probe every 60 s
+	tc.SetNoDelay(true)
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Header parsing (works on split / enhanced / custom payloads)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// getHeaderFromPayload scans EVERY line of the raw payload regardless of
+// which HTTP request block it belongs to.  This handles custom injection
+// formats like:
+//
+//	GET /cdn-cgi/trace HTTP/1.1\r\nHost: x\r\n\r\n
+//	CF-RAY / HTTP/1.1\r\nHost: y\r\nUpgrade: websocket\r\nSec-WebSocket-Key: …\r\n\r\n
+func getHeaderFromPayload(payload, key string) string {
+	needle := strings.ToLower(key) + ":"
+	for _, raw := range strings.Split(payload, "\n") {
+		line := strings.TrimRight(raw, "\r")
+		if strings.HasPrefix(strings.ToLower(line), needle) {
+			return strings.TrimSpace(line[len(needle):])
+		}
+	}
+	return ""
+}
+
+// getHeader is kept for backward compatibility – it wraps getHeaderFromPayload.
+func getHeader(headers, key string) string {
+	return getHeaderFromPayload(headers, key)
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// HTTP API server
+// ═════════════════════════════════════════════════════════════════════════════
+
+func startAPIServer(port int) {
+	mux := http.NewServeMux()
+
+	cors := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			w.Header().Set("Content-Type", "application/json")
+			if r.Method == "OPTIONS" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			next(w, r)
+		}
+	}
+
+	mux.HandleFunc("/api/status", cors(handleStatus))
+	mux.HandleFunc("/api/sessions", cors(handleSessions))
+	mux.HandleFunc("/api/sessions/active", cors(handleActiveSessions))
+	mux.HandleFunc("/api/users", cors(handleUsers))
+	mux.HandleFunc("/api/stats", cors(handleStats))
+	mux.HandleFunc("/health", cors(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(APIResponse{Success: true, Message: "OK"})
+	}))
+
+	addr := fmt.Sprintf(":%d", port)
+	logInfo("API", fmt.Sprintf("HTTP API listening on %s%s%s", ColorCyan, addr, ColorReset))
+
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logError("API", fmt.Sprintf("Server error: %v", err))
+	}
+}
+
+func handleStatus(w http.ResponseWriter, r *http.Request) {
+	active := 0
+	activeSessions.Range(func(_, _ interface{}) bool { active++; return true })
+	total := atomic.LoadInt64(&sessionCounter)
+	up := time.Since(serverStartTime)
+	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: map[string]interface{}{
+		"version":         Version,
+		"uptime":          up.String(),
+		"uptime_seconds":  int(up.Seconds()),
+		"total_sessions":  total,
+		"active_sessions": active,
+		"closed_sessions": total - int64(active),
+	}})
+}
+
+func handleSessions(w http.ResponseWriter, r *http.Request) {
+	var sessions []SessionInfo
+	userStats := make(map[string]UserStats)
+
+	activeSessions.Range(func(_, v interface{}) bool {
+		s := v.(*SessionInfo)
+		tx := atomic.LoadInt64(&s.TxBytes)
+		rx := atomic.LoadInt64(&s.RxBytes)
+		sessions = append(sessions, SessionInfo{
+			ID:             s.ID,
+			RealClientIP:   s.RealClientIP,
+			RealClientPort: s.RealClientPort,
+			Username:       s.Username,
+			SessionNumber:  s.SessionNumber,
+			PID:            s.PID,
+			SSHType:        s.SSHType,
+			StartTime:      s.StartTime,
+			TxBytes:        tx,
+			RxBytes:        rx,
+			Duration:       time.Since(s.StartTime).Round(time.Second).String(),
+			TxFormatted:    formatBytes(tx),
+			RxFormatted:    formatBytes(rx),
+			TotalFormatted: formatBytes(tx + rx),
+		})
+		if s.Username != "detecting..." && s.Username != "" {
+			us := userStats[s.Username]
+			us.Username = s.Username
+			us.SessionCount++
+			us.TotalTX += tx
+			us.TotalRX += rx
+			us.TotalBytes = us.TotalTX + us.TotalRX
+			us.TxFormatted = formatBytes(us.TotalTX)
+			us.RxFormatted = formatBytes(us.TotalRX)
+			us.TotalFormatted = formatBytes(us.TotalBytes)
+			userStats[s.Username] = us
+		}
+		return true
+	})
+
+	total := atomic.LoadInt64(&sessionCounter)
+	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: SessionsResponse{
+		TotalSessions:  total,
+		ActiveSessions: len(sessions),
+		ClosedSessions: total - int64(len(sessions)),
+		Sessions:       sessions,
+		UserStats:      userStats,
+	}})
+}
+
+func handleActiveSessions(w http.ResponseWriter, r *http.Request) {
+	var sessions []SessionInfo
+	activeSessions.Range(func(_, v interface{}) bool {
+		s := v.(*SessionInfo)
+		tx := atomic.LoadInt64(&s.TxBytes)
+		rx := atomic.LoadInt64(&s.RxBytes)
+		sessions = append(sessions, SessionInfo{
+			ID:             s.ID,
+			RealClientIP:   s.RealClientIP,
+			Username:       s.Username,
+			SessionNumber:  s.SessionNumber,
+			PID:            s.PID,
+			SSHType:        s.SSHType,
+			Duration:       time.Since(s.StartTime).Round(time.Second).String(),
+			TxFormatted:    formatBytes(tx),
+			RxFormatted:    formatBytes(rx),
+			TotalFormatted: formatBytes(tx + rx),
+		})
+		return true
+	})
+	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: map[string]interface{}{
+		"count": len(sessions), "sessions": sessions,
+	}})
+}
+
+func handleUsers(w http.ResponseWriter, r *http.Request) {
+	userStats := make(map[string]UserStats)
+	activeSessions.Range(func(_, v interface{}) bool {
+		s := v.(*SessionInfo)
+		if s.Username == "detecting..." || s.Username == "" {
+			return true
+		}
+		tx := atomic.LoadInt64(&s.TxBytes)
+		rx := atomic.LoadInt64(&s.RxBytes)
+		us := userStats[s.Username]
+		us.Username = s.Username
+		us.SessionCount++
+		us.TotalTX += tx
+		us.TotalRX += rx
+		us.TotalBytes = us.TotalTX + us.TotalRX
+		us.TxFormatted = formatBytes(us.TotalTX)
+		us.RxFormatted = formatBytes(us.TotalRX)
+		us.TotalFormatted = formatBytes(us.TotalBytes)
+		userStats[s.Username] = us
+		return true
+	})
+	var ul []UserStats
+	for _, u := range userStats {
+		ul = append(ul, u)
+	}
+	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: map[string]interface{}{
+		"count": len(ul), "users": ul,
+	}})
+}
+
+func handleStats(w http.ResponseWriter, r *http.Request) {
+	var tx, rx int64
+	active := 0
+	users := make(map[string]int)
+	activeSessions.Range(func(_, v interface{}) bool {
+		active++
+		s := v.(*SessionInfo)
+		tx += atomic.LoadInt64(&s.TxBytes)
+		rx += atomic.LoadInt64(&s.RxBytes)
+		if s.Username != "detecting..." && s.Username != "" {
+			users[s.Username]++
+		}
+		return true
+	})
+	total := atomic.LoadInt64(&sessionCounter)
+	up := time.Since(serverStartTime)
+	json.NewEncoder(w).Encode(APIResponse{Success: true, Data: map[string]interface{}{
+		"uptime":          up.String(),
+		"uptime_seconds":  int(up.Seconds()),
+		"total_sessions":  total,
+		"active_sessions": active,
+		"closed_sessions": total - int64(active),
+		"total_tx":        tx,
+		"total_rx":        rx,
+		"total_bytes":     tx + rx,
+		"tx_formatted":    formatBytes(tx),
+		"rx_formatted":    formatBytes(rx),
+		"total_formatted": formatBytes(tx + rx),
+		"unique_users":    len(users),
+		"users_breakdown": users,
+	}})
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Auth-log monitor (Dropbear + OpenSSH username detection)
+// ═════════════════════════════════════════════════════════════════════════════
+
 func authLogMonitor(ctx context.Context, authLogPath string) {
-	dropbearRegex := regexp.MustCompile(
+	dropbearRe := regexp.MustCompile(
 		`^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+` +
-		`\S+\s+` +
-		`dropbear\[(\d+)\]:\s+` +
-		`Password auth succeeded for '([^']{1,32})'\s+` +
-		`from\s+((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})`,
+			`\S+\s+dropbear\[(\d+)\]:\s+` +
+			`Password auth succeeded for '([^']{1,32})'\s+` +
+			`from\s+((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})`,
 	)
-	
-	opensshRegex := regexp.MustCompile(
+	opensshRe := regexp.MustCompile(
 		`^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+` +
-		`\S+\s+` +
-		`sshd\[(\d+)\]:\s+` +
-		`Accepted (?:password|publickey|keyboard-interactive)\s+` +
-		`for\s+([a-zA-Z0-9_-]{1,32})\s+` +
-		`from\s+((?:\d{1,3}\.){3}\d{1,3})\s+` +
-		`port\s+(\d{1,5})\s+` +
-		`ssh2?$`,
+			`\S+\s+sshd\[(\d+)\]:\s+` +
+			`Accepted (?:password|publickey|keyboard-interactive)\s+` +
+			`for\s+([a-zA-Z0-9_-]{1,32})\s+` +
+			`from\s+((?:\d{1,3}\.){3}\d{1,3})\s+` +
+			`port\s+(\d{1,5})\s+ssh2?$`,
 	)
-	
+
 	file, err := os.Open(authLogPath)
 	if err != nil {
 		logWarn("AUTH", fmt.Sprintf("Cannot open %s: %v (username detection disabled)", authLogPath, err))
 		return
 	}
 	defer file.Close()
-	
+
 	file.Seek(0, io.SeekEnd)
 	reader := bufio.NewReader(file)
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -670,33 +807,17 @@ func authLogMonitor(ctx context.Context, authLogPath string) {
 				if err != nil {
 					break
 				}
-				
-				if matches := dropbearRegex.FindStringSubmatch(line); len(matches) == 5 {
-					pidStr := matches[1]
-					username := matches[2]
-					ipAddr := matches[3]
-					portStr := matches[4]
-					
-					if !isStrictValidDropbearMatch(pidStr, username, ipAddr, portStr) {
-						continue
+				if m := dropbearRe.FindStringSubmatch(line); len(m) == 5 {
+					if isStrictValidDropbearMatch(m[1], m[2], m[3], m[4]) {
+						pid, _ := strconv.Atoi(m[1])
+						updateSessionUsername(pid, m[2], m[4], "dropbear")
 					}
-					
-					pid, _ := strconv.Atoi(pidStr)
-					updateSessionUsername(pid, username, portStr, "dropbear")
 				}
-				
-				if matches := opensshRegex.FindStringSubmatch(line); len(matches) == 5 {
-					pidStr := matches[1]
-					username := matches[2]
-					ipAddr := matches[3]
-					portStr := matches[4]
-					
-					if !isStrictValidOpenSSHMatch(pidStr, username, ipAddr, portStr) {
-						continue
+				if m := opensshRe.FindStringSubmatch(line); len(m) == 5 {
+					if isStrictValidOpenSSHMatch(m[1], m[2], m[3], m[4]) {
+						pid, _ := strconv.Atoi(m[1])
+						updateSessionUsername(pid, m[2], m[4], "openssh")
 					}
-					
-					pid, _ := strconv.Atoi(pidStr)
-					updateSessionUsername(pid, username, portStr, "openssh")
 				}
 			}
 		}
@@ -708,27 +829,20 @@ func isStrictValidDropbearMatch(pidStr, username, ipAddr, portStr string) bool {
 	if err != nil || pid < 1 || pid > 9999999 {
 		return false
 	}
-	
 	if len(username) < 1 || len(username) > 32 {
 		return false
 	}
 	for _, c := range username {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || 
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
 			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
 			return false
 		}
 	}
-	
 	if net.ParseIP(ipAddr) == nil {
 		return false
 	}
-	
 	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		return false
-	}
-	
-	return true
+	return err == nil && port >= 1 && port <= 65535
 }
 
 func isStrictValidOpenSSHMatch(pidStr, username, ipAddr, portStr string) bool {
@@ -736,187 +850,211 @@ func isStrictValidOpenSSHMatch(pidStr, username, ipAddr, portStr string) bool {
 	if err != nil || pid < 1 || pid > 9999999 {
 		return false
 	}
-	
 	if len(username) < 1 || len(username) > 32 {
 		return false
 	}
-	if !((username[0] >= 'a' && username[0] <= 'z') || 
-		(username[0] >= 'A' && username[0] <= 'Z') || 
+	if !((username[0] >= 'a' && username[0] <= 'z') ||
+		(username[0] >= 'A' && username[0] <= 'Z') ||
 		username[0] == '_') {
 		return false
 	}
 	for _, c := range username {
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || 
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
 			(c >= '0' && c <= '9') || c == '-' || c == '_') {
 			return false
 		}
 	}
-	
 	if net.ParseIP(ipAddr) == nil {
 		return false
 	}
-	
 	port, err := strconv.Atoi(portStr)
-	if err != nil || port < 1 || port > 65535 {
-		return false
-	}
-	
-	return true
+	return err == nil && port >= 1 && port <= 65535
 }
 
-func updateSessionUsername(pid int, username, sshSeesPort, sshType string) {
-	if sessionID, ok := sshPortToSession.Load(sshSeesPort); ok {
-		if sessionVal, exists := activeSessions.Load(sessionID); exists {
-			session := sessionVal.(*SessionInfo)
-			session.Username = username
-			session.PID = pid
-			session.SSHType = sshType
-			
-			if session.SessionNumber == 0 {
-				session.SessionNumber = getNextSessionNumber(username)
-			}
-			
-			activeSessions.Store(sessionID, session)
-			
-			sshTypeDisplay := ""
-			if sshType == "dropbear" {
-				sshTypeDisplay = " [Dropbear]"
-			} else if sshType == "openssh" {
-				sshTypeDisplay = " [OpenSSH]"
-			}
-			
-			userDisplay := formatUserDisplay(username, session.SessionNumber, pid)
-			
-			logInfo("AUTH", fmt.Sprintf("[%s] User authenticated: %s%s%s%s", 
-				session.ID, ColorBold, userDisplay, ColorReset, sshTypeDisplay))
-		}
+func updateSessionUsername(pid int, username, sshPort, sshType string) {
+	sid, ok := sshPortToSession.Load(sshPort)
+	if !ok {
+		return
 	}
+	val, exists := activeSessions.Load(sid)
+	if !exists {
+		return
+	}
+	s := val.(*SessionInfo)
+	s.Username = username
+	s.PID = pid
+	s.SSHType = sshType
+	if s.SessionNumber == 0 {
+		s.SessionNumber = getNextSessionNumber(username)
+	}
+	activeSessions.Store(sid, s)
+
+	tag := ""
+	switch sshType {
+	case "dropbear":
+		tag = " [Dropbear]"
+	case "openssh":
+		tag = " [OpenSSH]"
+	}
+	logInfo("AUTH", fmt.Sprintf("[%s] Authenticated: %s%s%s%s",
+		s.ID, ColorBold, formatUserDisplay(username, s.SessionNumber, pid), ColorReset, tag))
 }
 
-func splitHostPort(addr string) (host, port string) {
-	lastColon := strings.LastIndex(addr, ":")
-	if lastColon == -1 {
-		return addr, ""
-	}
-	return addr[:lastColon], addr[lastColon+1:]
-}
-
-func generateSessionID() string {
-	counter := atomic.AddInt64(&sessionCounter, 1)
-	b := make([]byte, 4)
-	rand.Read(b)
-	return fmt.Sprintf("%04d-%s", counter, hex.EncodeToString(b)[:6])
-}
+// ═════════════════════════════════════════════════════════════════════════════
+// Periodic monitors
+// ═════════════════════════════════════════════════════════════════════════════
 
 func sessionMonitor(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			count := 0
-			var userList []string
-			
-			activeSessions.Range(func(key, value interface{}) bool {
+			var users []string
+			activeSessions.Range(func(_, v interface{}) bool {
 				count++
-				session := value.(*SessionInfo)
-				if session.Username != "detecting..." && session.Username != "" && session.SessionNumber > 0 {
-					userList = append(userList, fmt.Sprintf("%s-%d", session.Username, session.SessionNumber))
+				s := v.(*SessionInfo)
+				if s.Username != "detecting..." && s.Username != "" && s.SessionNumber > 0 {
+					users = append(users, fmt.Sprintf("%s-%d", s.Username, s.SessionNumber))
 				}
 				return true
 			})
-			
 			if count > 0 {
-				userStats := strings.Join(userList, ", ")
-				if userStats == "" {
-					userStats = "authenticating..."
+				label := strings.Join(users, ", ")
+				if label == "" {
+					label = "authenticating..."
 				}
-				
-				logInfo("MONITOR", fmt.Sprintf("Active sessions: %s%d%s [%s]", 
-					ColorBold, count, ColorReset, userStats))
+				logInfo("MONITOR", fmt.Sprintf("Active sessions: %s%d%s [%s]",
+					ColorBold, count, ColorReset, label))
 			}
 		}
 	}
 }
 
 func logSessionSummary() {
-	fmt.Println("\n" + ColorCyan + "═══════════════════════════════════════════════════════" + ColorReset)
+	sep := ColorCyan + strings.Repeat("═", 57) + ColorReset
+	fmt.Println("\n" + sep)
 	fmt.Println(ColorCyan + "                 SESSION SUMMARY" + ColorReset)
-	fmt.Println(ColorCyan + "═══════════════════════════════════════════════════════" + ColorReset)
-	
-	totalSessions := atomic.LoadInt64(&sessionCounter)
-	activeCount := 0
-	userStats := make(map[string]struct {
-		Count   int
-		TotalTX int64
-		TotalRX int64
-	})
-	
-	activeSessions.Range(func(key, value interface{}) bool {
-		activeCount++
-		session := value.(*SessionInfo)
-		duration := time.Since(session.StartTime).Round(time.Second)
-		
-		userInfo := formatUserDisplay(session.Username, session.SessionNumber, session.PID)
-		
-		fmt.Printf("  [%s] %s:%s | User: %s | Duration: %v | TX: %s | RX: %s\n",
-			session.ID, session.RealClientIP, session.RealClientPort, userInfo, duration,
-			formatBytes(atomic.LoadInt64(&session.TxBytes)),
-			formatBytes(atomic.LoadInt64(&session.RxBytes)))
-		
-		if session.Username != "detecting..." && session.Username != "" {
-			stats := userStats[session.Username]
-			stats.Count++
-			stats.TotalTX += atomic.LoadInt64(&session.TxBytes)
-			stats.TotalRX += atomic.LoadInt64(&session.RxBytes)
-			userStats[session.Username] = stats
+	fmt.Println(sep)
+
+	total := atomic.LoadInt64(&sessionCounter)
+	active := 0
+	type urow struct{ count int; tx, rx int64 }
+	umap := make(map[string]*urow)
+
+	activeSessions.Range(func(_, v interface{}) bool {
+		active++
+		s := v.(*SessionInfo)
+		tx := atomic.LoadInt64(&s.TxBytes)
+		rx := atomic.LoadInt64(&s.RxBytes)
+		fmt.Printf("  [%s] %s:%s | %s | up:%v | TX:%s RX:%s\n",
+			s.ID, s.RealClientIP, s.RealClientPort,
+			formatUserDisplay(s.Username, s.SessionNumber, s.PID),
+			time.Since(s.StartTime).Round(time.Second),
+			formatBytes(tx), formatBytes(rx))
+		if s.Username != "detecting..." && s.Username != "" {
+			if umap[s.Username] == nil {
+				umap[s.Username] = &urow{}
+			}
+			umap[s.Username].count++
+			umap[s.Username].tx += tx
+			umap[s.Username].rx += rx
 		}
-		
 		return true
 	})
-	
-	if len(userStats) > 0 {
+
+	if len(umap) > 0 {
 		fmt.Println("\n  Per-User Statistics:")
-		for user, stats := range userStats {
-			fmt.Printf("    %s: %d sessions | TX: %s | RX: %s | Total: %s\n",
-				user, stats.Count, formatBytes(stats.TotalTX), formatBytes(stats.TotalRX),
-				formatBytes(stats.TotalTX+stats.TotalRX))
+		for u, r := range umap {
+			fmt.Printf("    %-20s %d sessions | TX:%s RX:%s Total:%s\n",
+				u+":", r.count, formatBytes(r.tx), formatBytes(r.rx), formatBytes(r.tx+r.rx))
 		}
 	}
-	
-	fmt.Printf("\n  Total Sessions: %d | Active: %d | Closed: %d\n",
-		totalSessions, activeCount, totalSessions-int64(activeCount))
-	fmt.Println(ColorCyan + "═══════════════════════════════════════════════════════" + ColorReset)
+
+	fmt.Printf("\n  Total:%d  Active:%d  Closed:%d\n", total, active, total-int64(active))
+	fmt.Println(sep)
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Misc helpers
+// ═════════════════════════════════════════════════════════════════════════════
+
+func getNextSessionNumber(username string) int {
+	if username == "" || username == "detecting..." {
+		return 0
+	}
+	max := 0
+	activeSessions.Range(func(_, v interface{}) bool {
+		if s := v.(*SessionInfo); s.Username == username && s.SessionNumber > max {
+			max = s.SessionNumber
+		}
+		return true
+	})
+	return max + 1
+}
+
+func formatUserDisplay(username string, num, pid int) string {
+	s := username
+	if username != "detecting..." && username != "" && num > 0 {
+		s = fmt.Sprintf("%s-%d", username, num)
+	}
+	if pid > 0 {
+		s = fmt.Sprintf("%s (PID:%d)", s, pid)
+	}
+	return s
+}
+
+func splitHostPort(addr string) (host, port string) {
+	i := strings.LastIndex(addr, ":")
+	if i == -1 {
+		return addr, ""
+	}
+	return addr[:i], addr[i+1:]
+}
+
+func generateSessionID() string {
+	n := atomic.AddInt64(&sessionCounter, 1)
+	b := make([]byte, 4)
+	rand.Read(b)
+	return fmt.Sprintf("%04d-%s", n, hex.EncodeToString(b)[:6])
+}
+
+func formatBytes(b int64) string {
+	const u = 1024
+	if b < u {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(u), 0
+	for n := b / u; n >= u; n /= u {
+		div *= u
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
 
 func setupFlags() Config {
 	c := Config{}
-	var logF1, logF2, logF3 string
-
-	flag.StringVar(&c.BindAddr, "b", "0.0.0.0", "Bind Address")
-	flag.IntVar(&c.Port, "p", 8080, "Port server")
-	flag.StringVar(&c.Password, "a", "", "Auth Password")
-	flag.StringVar(&c.FallbackAddr, "t", "127.0.0.1:22", "Default Target")
+	var lf1, lf2, lf3 string
+	flag.StringVar(&c.BindAddr, "b", "0.0.0.0", "Bind address")
+	flag.IntVar(&c.Port, "p", 2080, "Listen port")
+	flag.StringVar(&c.Password, "a", "", "Auth password (optional)")
+	flag.StringVar(&c.FallbackAddr, "t", "127.0.0.1:22", "Default SSH target")
 	flag.StringVar(&c.AuthLogPath, "auth-log", "/var/log/auth.log", "Auth log path")
-	flag.IntVar(&c.APIPort, "api-port", 8081, "HTTP API port (0 to disable)")
-	
-	flag.StringVar(&logF1, "l", "", "Log file path")
-	flag.StringVar(&logF2, "log", "", "Log file path")
-	flag.StringVar(&logF3, "logs", "", "Log file path")
-	
+	flag.IntVar(&c.APIPort, "api-port", 8081, "HTTP API port (0 = disabled)")
+	flag.StringVar(&lf1, "l", "", "Log file")
+	flag.StringVar(&lf2, "log", "", "Log file")
+	flag.StringVar(&lf3, "logs", "", "Log file")
 	flag.Parse()
-
-	if logF1 != "" { 
-		c.LogFile = logF1 
-	} else if logF2 != "" { 
-		c.LogFile = logF2 
-	} else { 
-		c.LogFile = logF3 
+	if lf1 != "" {
+		c.LogFile = lf1
+	} else if lf2 != "" {
+		c.LogFile = lf2
+	} else {
+		c.LogFile = lf3
 	}
-	
 	return c
 }
 
@@ -924,9 +1062,8 @@ func setupLogger(path string) {
 	writers := []io.Writer{os.Stdout}
 	if path != "" {
 		_ = os.MkdirAll(filepath.Dir(path), 0755)
-		file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err == nil { 
-			writers = append(writers, file) 
+		if f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+			writers = append(writers, f)
 		}
 	}
 	log.SetOutput(io.MultiWriter(writers...))
@@ -943,7 +1080,6 @@ func printProxyBanner() {
 	fmt.Println(`║                                                        `)
 	fmt.Printf("║  %s  VERSION   : %-37s %s\n", ColorGray, Version, ColorCyan)
 	fmt.Printf("║  %s  DEVELOPER : %-37s %s\n", ColorGray, Credits, ColorCyan)
-//	fmt.Println(`║  %s  FEATURES  : Dropbear + OpenSSH + Real IP + API    %s`, ColorGray, ColorCyan)
 	fmt.Println(`╚════════════════════════════════════════════════════════╝`)
 	fmt.Print(ColorReset)
 }
@@ -952,25 +1088,3 @@ func logInfo(tag, m string)    { log.Printf("%s[%s]%s %s", ColorBlue, tag, Color
 func logSuccess(tag, m string) { log.Printf("%s[%s]%s %s", ColorGreen, tag, ColorReset, m) }
 func logWarn(tag, m string)    { log.Printf("%s[%s]%s %s", ColorYellow, tag, ColorReset, m) }
 func logError(tag, m string)   { log.Printf("%s[%s]%s %s", ColorRed, tag, ColorReset, m) }
-
-func getHeader(headers, key string) string {
-	for _, line := range strings.Split(headers, "\r\n") {
-		if strings.HasPrefix(strings.ToLower(line), strings.ToLower(key)+": ") {
-			return strings.TrimSpace(line[strings.Index(line, ":")+1:])
-		}
-	}
-	return ""
-}
-
-func formatBytes(b int64) string {
-	const unit = 1024
-	if b < unit { 
-		return fmt.Sprintf("%d B", b) 
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
-}
