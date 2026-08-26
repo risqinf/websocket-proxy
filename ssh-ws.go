@@ -435,6 +435,16 @@ func doTransfer(client, target net.Conn, session *SessionInfo) {
 			case <-ticker.C:
 				tx := atomic.LoadInt64(&session.TxBytes)
 				rx := atomic.LoadInt64(&session.RxBytes)
+
+				// Auto-close abandoned unauthenticated probes (no TX from client within 30s)
+				if session.Username == "detecting..." && tx == 0 {
+					if time.Since(session.StartTime) > 30*time.Second {
+						client.Close()
+						target.Close()
+						return
+					}
+				}
+
 				if tx > 0 || rx > 0 {
 					session.LastActivity = time.Now()
 					dur := time.Since(session.StartTime).Round(time.Second)
@@ -770,54 +780,104 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 // ═════════════════════════════════════════════════════════════════════════════
 
 func authLogMonitor(ctx context.Context, authLogPath string) {
+	// Flexible regex that matches anywhere in the line, regardless of timestamp format (RFC3339, Syslog, ISO8601)
 	dropbearRe := regexp.MustCompile(
-		`^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+` +
-			`\S+\s+dropbear\[(\d+)\]:\s+` +
-			`Password auth succeeded for '([^']{1,32})'\s+` +
-			`from\s+((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})`,
+		`dropbear\[(\d+)\]:\s+Password auth succeeded for '([^']{1,32})'\s+from\s+((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})`,
 	)
 	opensshRe := regexp.MustCompile(
-		`^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+` +
-			`\S+\s+sshd\[(\d+)\]:\s+` +
-			`Accepted (?:password|publickey|keyboard-interactive)\s+` +
-			`for\s+([a-zA-Z0-9_-]{1,32})\s+` +
-			`from\s+((?:\d{1,3}\.){3}\d{1,3})\s+` +
-			`port\s+(\d{1,5})\s+ssh2?$`,
+		`sshd(?:-session)?\[(\d+)\]:\s+Accepted (?:password|publickey|keyboard-interactive)\s+for\s+([a-zA-Z0-9_-]{1,32})\s+from\s+((?:\d{1,3}\.){3}\d{1,3})\s+port\s+(\d{1,5})`,
 	)
 
-	file, err := os.Open(authLogPath)
-	if err != nil {
-		logWarn("AUTH", fmt.Sprintf("Cannot open %s: %v (username detection disabled)", authLogPath, err))
-		return
+	resolvePath := func() string {
+		if authLogPath != "" {
+			if _, err := os.Stat(authLogPath); err == nil {
+				return authLogPath
+			}
+		}
+		if _, err := os.Stat("/var/log/secure"); err == nil {
+			return "/var/log/secure"
+		}
+		if _, err := os.Stat("/var/log/auth.log"); err == nil {
+			return "/var/log/auth.log"
+		}
+		return authLogPath
 	}
-	defer file.Close()
 
-	_, _ = file.Seek(0, io.SeekEnd)
-	reader := bufio.NewReader(file)
+	var file *os.File
+	var lastOffset int64
+	var activePath string
+
+	openLog := func() bool {
+		target := resolvePath()
+		f, err := os.Open(target)
+		if err != nil {
+			return false
+		}
+		activePath = target
+		// Seek to end of file initially so we only monitor new logins
+		lastOffset, _ = f.Seek(0, io.SeekEnd)
+		file = f
+		logInfo("AUTH", fmt.Sprintf("Live log follower active on: %s%s%s (offset:%d)", ColorCyan, activePath, ColorReset, lastOffset))
+		return true
+	}
+
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
+			if file != nil {
+				file.Close()
+			}
 			return
 		case <-ticker.C:
-			for {
-				line, err := reader.ReadString('\n')
-				if err != nil {
-					break
+			if file == nil {
+				if !openLog() {
+					continue
 				}
-				if m := dropbearRe.FindStringSubmatch(line); len(m) == 5 {
-					if isStrictValidDropbearMatch(m[1], m[2], m[3], m[4]) {
-						pid, _ := strconv.Atoi(m[1])
-						updateSessionUsername(pid, m[2], m[4], "dropbear")
+			}
+
+			fi, err := file.Stat()
+			if err != nil {
+				file.Close()
+				file = nil
+				continue
+			}
+
+			// Handle log rotation or truncation
+			if fi.Size() < lastOffset {
+				lastOffset = 0
+				_, _ = file.Seek(0, io.SeekStart)
+			}
+
+			// New data arrived
+			if fi.Size() > lastOffset {
+				diff := fi.Size() - lastOffset
+				buf := make([]byte, diff)
+				n, err := file.ReadAt(buf, lastOffset)
+				if n > 0 {
+					lastOffset += int64(n)
+					scanner := bufio.NewScanner(strings.NewReader(string(buf[:n])))
+					for scanner.Scan() {
+						line := scanner.Text()
+						if m := dropbearRe.FindStringSubmatch(line); len(m) == 5 {
+							if isStrictValidDropbearMatch(m[1], m[2], m[3], m[4]) {
+								pid, _ := strconv.Atoi(m[1])
+								updateSessionUsername(pid, m[2], m[4], "dropbear")
+							}
+						}
+						if m := opensshRe.FindStringSubmatch(line); len(m) == 5 {
+							if isStrictValidOpenSSHMatch(m[1], m[2], m[3], m[4]) {
+								pid, _ := strconv.Atoi(m[1])
+								updateSessionUsername(pid, m[2], m[4], "openssh")
+							}
+						}
 					}
 				}
-				if m := opensshRe.FindStringSubmatch(line); len(m) == 5 {
-					if isStrictValidOpenSSHMatch(m[1], m[2], m[3], m[4]) {
-						pid, _ := strconv.Atoi(m[1])
-						updateSessionUsername(pid, m[2], m[4], "openssh")
-					}
+				if err != nil && err != io.EOF {
+					file.Close()
+					file = nil
 				}
 			}
 		}
