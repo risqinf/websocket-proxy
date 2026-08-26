@@ -352,14 +352,24 @@ jobs:
           [[ "$IS_DRAFT" == "true" ]] && FLAGS="${FLAGS} --draft"
           [[ "$IS_PRE"   != "true" ]] && FLAGS="${FLAGS} --latest"
 
-          # Buat release dengan body dari file (AMAN dari injection)
-          gh release create "${TAG}" \
-            --title "🚀 ${{ env.APP_NAME }} ${TAG}" \
-            --notes-file release-assets/release-body.md \
-            $FLAGS \
-            release-assets/*.tar.gz \
-            release-assets/*.zip \
-            release-assets/checksums.txt
+          # Buat release atau upload asset jika release sudah ada (mencegah error 'release already exists')
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists. Uploading assets..."
+            gh release edit "${TAG}" --notes-file release-assets/release-body.md $FLAGS || true
+            gh release upload "${TAG}" \
+              release-assets/*.tar.gz \
+              release-assets/*.zip \
+              release-assets/checksums.txt \
+              --clobber
+          else
+            gh release create "${TAG}" \
+              --title "🚀 ${{ env.APP_NAME }} ${TAG}" \
+              --notes-file release-assets/release-body.md \
+              $FLAGS \
+              release-assets/*.tar.gz \
+              release-assets/*.zip \
+              release-assets/checksums.txt
+          fi
 
       - name: Summary
         run: |

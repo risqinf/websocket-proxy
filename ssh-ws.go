@@ -73,7 +73,7 @@ import (
 // ─── Build-time variables ────────────────────────────────────────────────────
 
 var (
-	Version = "v1.3-Stable"
+	Version = "v1.3.1-Stable"
 	Credits = "Risqi Nur Fadhilah"
 )
 
